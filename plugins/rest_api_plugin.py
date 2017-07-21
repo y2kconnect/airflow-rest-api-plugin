@@ -1,9 +1,18 @@
+# -*- coding: utf-8 -*-
+''' 待完成 REST_API.backfill
+'''
+
 __author__ = 'robertsanders'
 __version__ = "1.0.3"
 
-from airflow.models import DagBag, DagModel
+from airflow import configuration, jobs, settings
+from airflow.api.common.experimental import trigger_dag as trigger
+from airflow.bin import cli
+from airflow.exceptions import AirflowException
+from airflow.executors import DEFAULT_EXECUTOR
+from airflow.models import DagBag, DagModel, DagRun, TaskInstance
 from airflow.plugins_manager import AirflowPlugin
-from airflow import configuration
+from airflow.ti_deps.dep_context import DepContext, QUEUE_DEPS, SCHEDULER_DEPS
 from airflow.www.app import csrf
 
 from flask import Blueprint, request, jsonify
@@ -11,10 +20,12 @@ from flask_admin import BaseView, expose
 
 from datetime import datetime
 import airflow
+import dateutil.parser
 import logging
-import subprocess
 import os
 import socket
+import subprocess
+import warnings
 
 """
 CLIs this REST API exposes are Defined here: http://airflow.incubator.apache.org/cli.html
@@ -510,6 +521,9 @@ class REST_API_Response_Util():
 
 # REST_API View which extends the flask_admin BaseView
 class REST_API(BaseView):
+    s_msg = 'Given {} date, {}, could not be identified as a date. Example ' \
+            'date format: 2015-11-16T14:34:15 or 2015-11-16T14:34:15+08:00'
+
 
     # Checks a string object to see if it is none or empty so we can determine if an argument (passed to the rest api) is provided
     @staticmethod
@@ -536,14 +550,15 @@ class REST_API(BaseView):
                 "is_active": (not orm_dag.is_paused) if orm_dag is not None else False
             })
 
-        return self.render("rest_api_plugin/index.html",
-                           dags=dags,
-                           airflow_webserver_base_url=airflow_webserver_base_url,
-                           rest_api_endpoint=rest_api_endpoint,
-                           apis_metadata=apis_metadata,
-                           airflow_version=airflow_version,
-                           rest_api_plugin_version=rest_api_plugin_version
-                           )
+        return self.render(
+                "rest_api_plugin/index.html",
+                dags=dags,
+                airflow_webserver_base_url=airflow_webserver_base_url,
+                rest_api_endpoint=rest_api_endpoint,
+                apis_metadata=apis_metadata,
+                airflow_version=airflow_version,
+                rest_api_plugin_version=rest_api_plugin_version,
+                )
 
     # '/api' REST Endpoint where API requests should all come in
     @csrf.exempt  # Exempt the CSRF token
@@ -593,17 +608,8 @@ class REST_API(BaseView):
             logging.info("DAG_ID '" + str(dag_id) + "' was not found in the DagBag list '" + str(dag_bag.dags) + "'")
             return REST_API_Response_Util.get_400_error_response(base_response, "The DAG ID '" + str(dag_id) + "' does not exist")
 
-        # Deciding which function to use based off the API object that was requested. Some functions are custom and need to be manually routed to.
-        if api == "version":
-            final_response = self.version(base_response)
-        elif api == "rest_api_plugin_version":
-            final_response = self.rest_api_plugin_version(base_response)
-        elif api == "deploy_dag":
-            final_response = self.deploy_dag(base_response)
-        elif api == "refresh_dag":
-            final_response = self.refresh_dag(base_response)
-        else:
-            final_response = self.execute_cli(base_response, api_metadata)
+        # Deciding which function to use based off the API object that was requested.
+        final_response = self.execute_cli(base_response, api_metadata)
 
         return final_response
 
@@ -611,6 +617,10 @@ class REST_API(BaseView):
     # A command will be assembled and then passed to the OS as a commandline function and the results will be returned
     def execute_cli(self, base_response, api_metadata):
         logging.info("Executing cli function")
+
+        func = getattr(self, api_metadata["name"], None)
+        if func is not None:
+            return func(base_response)
 
         # getting the largest cli_end_position in the api_metadata object so that the cli function can be assembled
         largest_end_argument_value = 0
@@ -681,99 +691,6 @@ class REST_API(BaseView):
 
         return REST_API_Response_Util.get_200_response(base_response=base_response, output=output, airflow_cmd=airflow_cmd)
 
-    # Custom function for the version API
-    def version(self, base_response):
-        logging.info("Executing custom 'version' function")
-        return REST_API_Response_Util.get_200_response(base_response, airflow_version)
-
-    # Custom function for the rest_api_plugin_version API
-    def rest_api_plugin_version(self, base_response):
-        logging.info("Executing custom 'rest_api_plugin_version' function")
-        return REST_API_Response_Util.get_200_response(base_response, rest_api_plugin_version)
-
-    # Custom Function for the deploy_dag API
-    def deploy_dag(self, base_response):
-        logging.info("Executing custom 'deploy_dag' function")
-
-        if 'dag_file' not in request.files or request.files['dag_file'].filename == '':  # check if the post request has the file part
-            logging.warning("The dag_file argument wasn't provided")
-            return REST_API_Response_Util.get_400_error_response(base_response, "dag_file should be provided")
-        dag_file = request.files['dag_file']
-
-        force = True if request.form.get('force') is not None else False
-        logging.info("deploy_dag force upload: " + str(force))
-
-        pause = True if request.form.get('pause') is not None else False
-        logging.info("deploy_dag in pause state: " + str(pause))
-
-        unpause = True if request.form.get('unpause') is not None else False
-        logging.info("deploy_dag in unpause state: " + str(unpause))
-
-        # make sure that the dag_file is a python script
-        if dag_file and dag_file.filename.endswith(".py"):
-            save_file_path = os.path.join(airflow_dags_folder, dag_file.filename)
-
-            # Check if the file already exists.
-            if os.path.isfile(save_file_path) and not force:
-                logging.warning("File to upload already exists")
-                return REST_API_Response_Util.get_400_error_response(base_response, "The file '" + save_file_path + "' already exists on host '" + hostname + "'.")
-
-            logging.info("Saving file to '" + save_file_path + "'")
-            dag_file.save(save_file_path)
-
-        else:
-            logging.warning("deploy_dag file is not a python file. It does not end with a .py.")
-            return REST_API_Response_Util.get_400_error_response(base_response, "dag_file is not a *.py file")
-
-        warning = None
-        # if both the pause and unpause options are provided then skip the pausing and unpausing phase
-        if not (pause and unpause):
-            if pause or unpause:
-                try:
-                    # import the DAG file that was uploaded so that we can get the DAG_ID to execute the command to pause or unpause it
-                    import imp
-                    dag_file = imp.load_source('module.name', save_file_path)
-                    dag_id = dag_file.dag.dag_id
-
-                    # run the pause or unpause cli command
-                    airflow_cmd_split = []
-                    if pause:
-                        airflow_cmd_split = ["airflow", "pause", dag_id]
-                    if unpause:
-                        airflow_cmd_split = ["airflow", "unpause", dag_id]
-                    cli_output = self.execute_cli_command(airflow_cmd_split)
-                except Exception as e:
-                    warning = "Failed to set the state (pause, unpause) of the DAG: " + str(e)
-                    logging.warning(warning)
-        else:
-            warning = "Both options pause and unpause were given. Skipping setting the state (pause, unpause) of the DAG."
-            logging.warning(warning)
-
-        return REST_API_Response_Util.get_200_response(base_response=base_response, output="DAG File [{}] has been uploaded".format(dag_file), warning=warning)
-
-    # Custom Function for the refresh_dag API
-    # This will call the direct function corresponding to the web endpoint '/admin/airflow/refresh' that already exists in Airflow
-    def refresh_dag(self, base_response):
-        logging.info("Executing custom 'refresh_dag' function")
-        dag_id = request.args.get('dag_id')
-        logging.info("dag_id to refresh: '" + str(dag_id) + "'")
-        if self.is_arg_not_provided(dag_id):
-            return REST_API_Response_Util.get_400_error_response(base_response, "dag_id should be provided")
-        elif " " in dag_id:
-            return REST_API_Response_Util.get_400_error_response(base_response, "dag_id contains spaces and is therefore an illegal argument")
-
-        try:
-            from airflow.www.views import Airflow
-            # NOTE: The request argument 'dag_id' is required for the refresh() function to get the dag_id
-            refresh_result = Airflow().refresh()
-            logging.info("Refresh Result: " + str(refresh_result))
-        except Exception as e:
-            error_message = "An error occurred while trying to Refresh the DAG '" + str(dag_id) + "': " + str(e)
-            logging.error(error_message)
-            return REST_API_Response_Util.get_500_error_response(base_response, error_message)
-
-        return REST_API_Response_Util.get_200_response(base_response=base_response, output="DAG [{}] is now fresh as a daisy".format(dag_id))
-
     # Executes the airflow command passed into it in the background so the function isn't tied to the webserver process
     @staticmethod
     def execute_cli_command_background_mode(airflow_cmd):
@@ -837,6 +754,749 @@ class REST_API(BaseView):
             new_stdout_array = new_stdout_array[content_to_remove_greatest_index:]
             output["stdout"] = "\n".join(new_stdout_array)
         return output
+
+    def version(self, base_response):
+        'Custom function for the version API'
+        logging.info("Executing custom 'version' function")
+        output = "v" + airflow_version
+        return REST_API_Response_Util.get_200_response(base_response, output)
+
+    def rest_api_plugin_version(self, base_response):
+        'Custom function for the rest_api_plugin_version API'
+        logging.info("Executing custom 'rest_api_plugin_version' function")
+        output = "v" + rest_api_plugin_version
+        return REST_API_Response_Util.get_200_response(base_response, output)
+
+    def pause(self, base_response):
+        return self._set_is_pause(base_response, True)
+
+    def unpause(self, base_response):
+        return self._set_is_pause(base_response, False)
+
+    def _set_is_pause(self, base_response, is_pause):
+        dag_id = request.args.get('dag_id')
+        subdir = request.args.get('subdir')
+
+        try:
+            dag = self.set_is_paused(is_pause, dag_id, subdir)
+            output = "Dag: {}, paused: {}".format(dag, dag.is_paused)
+        except AirflowException as e:
+            error_message = str(e)
+            logging.error(error_message)
+            return REST_API_Response_Util.get_400_error_response(base_response,
+                    error_message)
+        else:
+            return REST_API_Response_Util.get_200_response(base_response,
+                    output)
+
+    def set_is_paused(self, is_paused, dag_id, subdir=None):
+        dagbag = DagBag(cli.process_subdir(subdir))
+        if dag_id:
+            dag = dagbag.get_dag(dag_id)
+        else:
+            msg = 'Who hid the dig_id!?'
+            raise AirflowException(msg)
+        session = settings.Session()
+        dm = session.query(DagModel).filter(
+                DagModel.dag_id == dag.dag_id,
+                ).first()
+        dm.is_paused = is_paused
+        session.commit()
+        return dag
+
+    def task_failed_deps(self, base_response):
+        ''' Returns the unmet dependencies for a task instance from the
+        perspective of the scheduler. In other words, why a task instance 
+        doesn't get scheduled and then queued by the scheduler, and then run by
+        an executor).
+        '''
+        logging.info("Executing custom 'task_failed_deps' function")
+
+        dag_id = request.args.get('dag_id')
+        task_id = request.args.get('task_id')
+        execution_date = request.args.get('execution_date')
+        subdir = request.args.get('subdir')
+
+        try:
+            dagbag = DagBag(cli.process_subdir(subdir))
+            if dag_id:
+                dag = dagbag.get_dag(dag_id)
+            else:
+                raise AirflowException('Who hid the dig_id!?')
+            task = dag.get_task(task_id=task_id)
+            try:
+                execution_date = dateutil.parser.parse(execution_date)
+            except (ValueError, OverflowError):
+                raise AirflowException(self.s_msg.format(
+                        'execution', execution_date))
+            ti = TaskInstance(task, execution_date)
+            dep_context = DepContext(deps=SCHEDULER_DEPS)
+            failed_deps = list(ti.get_failed_dep_statuses(dep_context=
+                    dep_context))
+            if failed_deps:
+                info = {dep.dep_name: dep.reason for dep in failed_deps}
+                raise AirflowException(info)
+            output = "Task instance dependencies are all met."
+        except AirflowException as e:
+            error_message = str(e)
+            logging.error(error_message)
+            return REST_API_Response_Util.get_400_error_response(base_response,
+                    error_message)
+        else:
+            return REST_API_Response_Util.get_200_response(base_response,
+                    output)
+
+    # Custom function for the trigger_dag API
+    def trigger_dag(self, base_response):
+        'Trigger a DAG run'
+        logging.info("Executing custom 'trigger_dag' function")
+
+        dag_id = request.args.get('dag_id')
+        execution_date = request.args.get('exec_date')
+        run_id = request.args.get('run_id')
+        conf = request.args.get('conf')
+
+        try:
+            if execution_date:
+                try:
+                    execution_date = dateutil.parser.parse(execution_date)
+                except (ValueError, OverflowError):
+                    error_message = self.s_msg.format('execution',
+                            execution_date)
+                    raise AirflowException(error_message)
+            else:
+                execution_date = datetime.now()
+            if not run_id:
+                run_id = "manual__{0}".format(execution_date.isoformat())
+            dr = trigger.trigger_dag(dag_id, run_id, conf, execution_date)
+            output = dr.to_json()
+        except AirflowException as e:
+            error_message = str(e)
+            logging.error(error_message)
+            return REST_API_Response_Util.get_400_error_response(base_response,
+                    error_message)
+        else:
+            return REST_API_Response_Util.get_200_response(base_response,
+                    output)
+
+    def dag_state(self, base_response):
+        logging.info("Executing custom 'dag_state' function")
+
+        dag_id = request.args.get('dag_id')
+        execution_date = request.args.get('execution_date')
+        subdir = request.args.get('subdir')
+
+        try:
+            dagbag = DagBag(cli.process_subdir(subdir))
+            dag = dagbag.get_dag(dag_id)
+            try:
+                execution_date = dateutil.parser.parse(execution_date)
+            except (ValueError, OverflowError):
+                error_message = self.s_msg.format('execution', execution_date)
+                raise AirflowException(error_message)
+            dr = DagRun.find(dag_id, execution_date=execution_date)
+            output = dr[0].state if len(dr) > 0 else None
+        except AirflowException as e:
+            error_message = str(e)
+            logging.error(error_message)
+            return REST_API_Response_Util.get_400_error_response(base_response,
+                    error_message)
+        else:
+            return REST_API_Response_Util.get_200_response(base_response,
+                    output)
+
+    def run(self, base_response):
+        'Run a single task instance'
+        s_warn = 'The S3_LOG_FOLDER conf key has been replaced by ' \
+                'REMOTE_BASE_LOG_FOLDER. Your conf still works but please ' \
+                'update airflow.cfg to ensure future compatibility.'
+        logging.info("Executing custom 'run_web' function")
+
+        dag_id = request.args.get('dag_id')
+        task_id = request.args.get('task_id')
+        execution_date = request.args.get('execution_date')
+        subdir = request.args.get('subdir')
+        mark_success = True if 'mark_success' in request.args else False
+        force = True if 'force' in request.args else False
+        pool = request.args.get('pool')
+        cfg_path = request.args.get('cfg_path')
+        local = True if 'local' in request.args else False
+        ignore_all_dependencies = True if 'ignore_all_dependencies' in \
+                request.args else False
+        ignore_dependencies = True if 'ignore_dependencies' in request.args \
+                else False
+        ignore_depends_on_past = True if 'ignore_depends_on_past' in \
+                request.args else False
+        ship_dag = True if 'ship_dag' in request.args else False
+        pickle = request.args.get('pickle')
+
+        try:
+            if cfg_path and os.path.exists(cfg_path):
+                with open(cfg_path, 'r') as conf_file:
+                   conf_dict = json.load(conf_file)
+                for section, config in conf_dict.items():
+                    for option, value in config.items():
+                        configuration.set(section, option, value)
+                settings.configure_vars()
+                settings.configure_orm()
+
+            logging.root.handlers = []
+            log_base = os.path.expanduser(configuration.get('core',
+                    'BASE_LOG_FOLDER'))
+            directory = '{}/{}/{}'.format(log_base, dag_id, task_id)
+            if not os.path.exists(directory):
+                mkdirs(directory, 0o775)
+            filename = "{}/{}".format(directory, execution_date)
+            if not os.path.exists(filename):
+                open(filename, "a").close()
+                os.chmod(filename, 0o666)
+            logging.basicConfig(
+                    filename=filename,
+                    level=settings.LOGGING_LEVEL,
+                    format=settings.LOG_FORMAT,
+                    )
+
+            session = settings.Session()
+            dagbag = DagBag(cli.process_subdir(subdir))
+            if dag_id:
+                dag = dagbag.get_dag(dag_id)
+            elif ship_dag and pickle:
+                dag_pickle = session.query(DagPickle).filter(
+                        DagPickle.id == pickle,
+                        ).first()
+                if dag_pickle:
+                    dag = dag_pickle.pickle
+                else:
+                    msg = "Who hid the pickle!? [missing pickle]"
+                    raise AirflowException(msg)
+            else:
+                msg = 'Who hid the dig_id!? [dag_id or pickle]'
+                raise AirflowException(msg)
+            task = dag.get_task(task_id=task_id)
+            try:
+                execution_date = dateutil.parser.parse(execution_date)
+            except (ValueError, OverflowError):
+                error_message = self.s_msg.format('execution', execution_date)
+                raise AirflowException(error_message)
+            ti = TaskInstance(task, execution_date)
+            ti.refresh_from_db()
+
+            if local:
+                logging.info('Logging into: {}'.format(filename))
+                run_job = jobs.LocalTaskJob(
+                        task_instance=ti,
+                        mark_success=mark_success,
+                        pickle_id=pickle,
+                        ignore_all_deps=ignore_all_dependencies,
+                        ignore_depends_on_past=ignore_depends_on_past,
+                        ignore_task_deps=ignore_dependencies,
+                        ignore_ti_state=force,
+                        pool=pool,
+                        )
+                run_job.run()
+            else:
+                pickle_id = None
+                if ship_dag:
+                    try:
+                        # Running remotely, so pickling the DAG
+                        pickle = DagPickle(dag)
+                        session.add(pickle)
+                        session.commit()
+                        pickle_id = pickle.id
+                        msg = 'Pickled dag {dag} as pickle_id:{pickle_id}' \
+                                .format(dag, pickle_id)
+                        logging.info(msg)
+                    except Exception as e:
+                        error_message = 'Could not pickle the DAG, {}'.format(e)
+                        logging.error(error_message)
+                        return REST_API_Response_Util.get_400_error_response(
+                                base_response, error_message,
+                                )
+                executor = DEFAULT_EXECUTOR
+                executor.start()
+                logging.info('Sending to executor.')
+                executor.queue_task_instance(
+                        ti,
+                        mark_success=mark_success,
+                        pickle_id=pickle_id,
+                        ignore_all_deps=ignore_all_dependencies,
+                        ignore_depends_on_past=ignore_depends_on_past,
+                        ignore_task_deps=ignore_dependencies,
+                        ignore_ti_state=force,
+                        pool=pool,
+                        )
+                executor.heartbeat()
+                executor.end()
+            logging.root.handlers[0].flush()
+            logging.root.handlers = []
+            # store logs remotely
+            remote_base = configuration.get('core', 'REMOTE_BASE_LOG_FOLDER')
+            # deprecated as of March 2016
+            if not remote_base and configuration.get('core', 'S3_LOG_FOLDER'):
+                warnings.warn(s_warn, DeprecationWarning)
+                remote_base = configuration.get('core', 'S3_LOG_FOLDER')
+            if os.path.exists(filename):
+                # read log and remove old logs to get just the latest additions
+                with open(filename, 'r') as logfile:
+                    log = logfile.read()
+                remote_log_location = filename.replace(log_base, remote_base)
+                # S3
+                if remote_base.startswith('s3:/'):
+                    logging_utils.S3Log().write(log, remote_log_location)
+                # GCS
+                elif remote_base.startswith('gs:/'):
+                    logging_utils.GCSLog().write(log, remote_log_location)
+                # Other
+                elif remote_base and remote_base != 'None':
+                    logging.error('Unsupported remote log location: {}'.format(
+                            remote_base))
+            output = {
+                    'message': 'Sent {} to the message queue, it should start' \
+                            ' any moment now.'.format(ti),
+                    'detail': ti.to_json(),
+                    }
+        except AirflowException as e:
+            error_message = str(e)
+            logging.error(error_message)
+            return REST_API_Response_Util.get_400_error_response(base_response,
+                    error_message)
+        else:
+            return REST_API_Response_Util.get_200_response(base_response,
+                    output)
+
+    def list_tasks(self, base_response):
+        'List the tasks within a DAG'
+        logging.info("Executing custom 'list_tasks' function")
+
+        dag_id = request.args.get('dag_id')
+        tree = True if 'tree' in request.args else False
+        subdir = request.args.get('subdir')
+
+        def get_downstream(arr,task, level=0):
+            s_level = '{} {}'.format(level, '-' * level * 4)
+            arr.append({s_level: str(task)})
+            level += 1
+            for t in task.upstream_list:
+                get_downstream(arr, t, level)
+
+        try:
+            dagbag = DagBag(cli.process_subdir(subdir))
+            if dag_id:
+                dag = dagbag.get_dag(dag_id)
+                if dag is None:
+                    raise AirflowException('active DAG not found')
+            else:
+                raise AirflowException('Who hid the dig_id!?')
+            if tree:
+                arr = []
+                roots = [t for t in dag.tasks if not t.downstream_list]
+                for t in roots:
+                    get_downstream(arr, t)
+                output = arr
+            else:
+                output = sorted([t.task_id for t in dag.tasks])
+        except AirflowException as e:
+            error_message = str(e)
+            logging.error(error_message)
+            return REST_API_Response_Util.get_400_error_response(base_response,
+                    error_message)
+        else:
+            return REST_API_Response_Util.get_200_response(base_response,
+                    output)
+
+    def backfill(self, base_response):
+        pass
+
+        arr = set(request.args.keys())
+        dag_id = request.args.get('dag_id')
+        task_regex = request.args.get('task_regex')
+        start_date = request.args.get('start_date')
+        end_date = request.args.get('end_date')
+        mark_success = True if 'mark_success' in arr else False
+        local = True if 'local' in arr else False
+        donot_pickle = True if 'donot_pickle' in arr else False
+        include_adhoc = True if 'include_adhoc' in arr else False
+        ignore_dependencies = True if 'ignore_dependencies' in arr else False
+        ignore_first_depends_on_past = True if 'ignore_first_depends_on_past' \
+                in arr else False
+        subdir = request.args.get('subdir')
+        pool = request.args.get('pool')
+        dry_run = request.args.get('dry_run')
+        del arr
+
+        dagbag = DagBag(cli.process_subdir(subdir))
+        try:
+            if dag_id:
+                dag = dagbag.get_dag(dag_id)
+            elif ship_dag and pickle:
+                dag_pickle = session.query(DagPickle).filter(
+                        DagPickle.id == pickle,
+                        ).first()
+                if dag_pickle:
+                    dag = dag_pickle.pickle
+                else:
+                    msg = "Who hid the pickle!? [missing pickle]"
+                    raise AirflowException(msg)
+            else:
+                msg = 'Who hid the dig_id!? [dag_id or pickle]'
+                raise AirflowException(msg)
+        except AirflowException as err:
+            error_message = str(err)
+            logging.error(error_message)
+            return REST_API_Response_Util.get_400_error_response(
+                    base_response, error_message,
+                    )
+
+        if start_date:
+            try:
+                start_date = dateutil.parser.parse(start_date)
+            except (ValueError, OverflowError):
+                error_message = (
+                        'Given start date, {}, could not be identified as a '
+                        'date. Example date format: 2015-11-16'.format(start_date)
+                        )
+                logging.error(error_message)
+                return REST_API_Response_Util.get_400_error_response(
+                        base_response, error_message,
+                        )
+
+        if end_date:
+            try:
+                end_date = dateutil.parser.parse(end_date)
+            except (ValueError, OverflowError):
+                error_message = (
+                        'Given end date, {}, could not be identified as a date.'
+                        'Example date format: 2015-11-16'.format(end_date)
+                        )
+                logging.error(error_message)
+                return REST_API_Response_Util.get_400_error_response(
+                        base_response, error_message,
+                        )
+
+        if not args.start_date and not args.end_date:
+            error_message = "Provide a start_date and/or end_date"
+            logging.error(error_message)
+            return REST_API_Response_Util.get_400_error_response(
+                    base_response, error_message,
+                    )
+        else:
+            # If only one date is passed, using same as start and end
+            end_date = end_date or start_date
+            start_date = start_date or end_date
+
+        if task_regex:
+            dag = dag.sub_dag(
+                    task_regex=args.task_regex,
+                    include_upstream=not ignore_dependencies,
+                    )
+
+        if dry_run:
+            msg = "Dry run of DAG {0} on {1}".format(dag_id, start_date)
+            loggin.info(msg)
+            for task in dag.tasks:
+                msg = "Task {0}".format(task.task_id)
+                loggin.info(msg)
+                ti = TaskInstance(task, args.start_date)
+                ti.dry_run()
+        else:
+            dag.run(
+                    start_date=start_date,
+                    end_date=end_date,
+                    mark_success=mark_success,
+                    include_adhoc=include_adhoc,
+                    local=local,
+                    donot_pickle=(
+                            donot_pickle
+                            or conf.getboolean('core', 'donot_pickle')
+                            ),
+                    ignore_first_depends_on_past=ignore_first_depends_on_past,
+                    ignore_task_deps=ignore_dependencies,
+                    pool=pool,
+                    )
+        output = 'Finish'
+        return REST_API_Response_Util.get_200_response(base_response, output)
+
+    def list_dags(self, base_response):
+        subdir = request.args.get('subdir')
+        dagbag = DagBag(cli.process_subdir(subdir))
+        output = sorted(dagbag.dags)
+        return REST_API_Response_Util.get_200_response(base_response, output)
+
+    def task_state(self, base_response):
+        dag_id = request.args.get('dag_id')
+        task_id = request.args.get('task_id')
+        execution_date = request.args.get('execution_date')
+        subdir = request.args.get('subdir')
+
+        dagbag = DagBag(cli.process_subdir(subdir))
+        try:
+            if dag_id:
+                dag = dagbag.get_dag(dag_id)
+            else:
+                msg = 'Who hid the dig_id!?'
+                raise AirflowException(msg)
+        except AirflowException as err:
+            error_message = str(err)
+            logging.error(error_message)
+            return REST_API_Response_Util.get_400_error_response(
+                    base_response, error_message,
+                    )
+        task = dag.get_task(task_id=task_id)
+
+        try:
+            execution_date = dateutil.parser.parse(execution_date)
+        except (ValueError, OverflowError):
+            error_message = (
+                    'Given execution date, {}, could not be identified as '
+                    'a date. Example date format: 2015-11-16T14:34:15 or '
+                    '2015-11-16T14:34:15+08:00'.format(execution_date)
+                    )
+            logging.error(error_message)
+            return REST_API_Response_Util.get_400_error_response(
+                    base_response, error_message,
+                    )
+
+        ti = TaskInstance(task, execution_date)
+        output = ti.current_state()
+        return REST_API_Response_Util.get_200_response(base_response, output)
+
+    def pool(self, base_response):
+        args_set = request.args.get('set')
+        args_get = request.args.get('get')
+        args_delete = request.args.get('delete')
+
+        session = settings.Session()
+        qs = session.query(Pool)
+        if args_set:
+            # set
+            name, slot_count, pool_description = args_set.split()
+            pool = qs.filter_by(pool=name).first()
+            flag_dirty = False
+            if pool is None:
+                pool = Pool(
+                        pool=name,
+                        slots=slot_count,
+                        description=pool_description,
+                        )
+                flag_dirty = True
+            else:
+                if pool.slots != slot_count:
+                    pool.slots = slot_count
+                    flag_dirty = True
+                if pool.description != pool_description:
+                    pool.description = pool_description
+                    flag_dirty = True
+            if flag_dirty:
+                session.add(pool)
+                session.commit()
+            output = pool.to_json()
+        elif args_get:
+            # get
+            pool = qs.filter_by(pool=args_get).first()
+            if pool is None:
+                error_message = 'The {} record does not exist'.format(args_get)
+                logging.error(error_message)
+                return REST_API_Response_Util.get_400_error_response(
+                        base_response, error_message,
+                        )
+            else:
+                output = pool.to_json()
+        else:
+            # delete
+            pool = qs.filter_by(pool=args_delete).first()
+            if pool is None:
+                error_message = 'The {} record does not exist'.format(args_get)
+                logging.error(error_message)
+                return REST_API_Response_Util.get_400_error_response(
+                        base_response, error_message,
+                        )
+            else:
+                qs.filter_by(pool=args_delete).delete()
+                session.commit()
+                output = 'The record has been deleted'
+        return REST_API_Response_Util.get_200_response(base_response, output)
+
+    def clear(self, base_response):
+        pass
+        arr = set(request.args.keys())
+        dag_id = request.args.get('dag_id')
+        task_regex = request.args.get('task_regex')
+        start_date = request.args.get('start_date')
+        end_date = request.args.get('end_date')
+        subdir = request.args.get('subdir')
+        upstream = True if 'upstream' in arr else False
+        downstream = True if 'downstream' in arr else False
+        only_failed = True if 'only_failed' in arr else False
+        only_running = True if 'only_running' in arr else False
+        exclude_subdags = True if 'exclude_subdags' in arr else False
+        del arr
+
+        dagbag = DagBag(cli.process_subdir(subdir))
+        try:
+            if dag_id:
+                dag = dagbag.get_dag(dag_id)
+            else:
+                msg = 'Who hid the dig_id!? [dag_id or pickle]'
+                raise AirflowException(msg)
+        except AirflowException as err:
+            error_message = str(err)
+            logging.error(error_message)
+            return REST_API_Response_Util.get_400_error_response(
+                    base_response, error_message,
+                    )
+
+        if start_date:
+            try:
+                start_date = dateutil.parser.parse(start_date).date()
+            except (ValueError, OverflowError):
+                error_message = (
+                        'Given start date, {}, could not be identified as a '
+                        'date. Example date format: 2015-11-16'.format(start_date)
+                        )
+                logging.error(error_message)
+                return REST_API_Response_Util.get_400_error_response(
+                        base_response, error_message,
+                        )
+
+        if end_date:
+            try:
+                end_date = dateutil.parser.parse(end_date)
+            except (ValueError, OverflowError):
+                error_message = (
+                        'Given end date, {}, could not be identified as a date.'
+                        'Example date format: 2015-11-16'.format(end_date)
+                        )
+                logging.error(error_message)
+                return REST_API_Response_Util.get_400_error_response(
+                        base_response, error_message,
+                        )
+
+        if task_regex:
+            dag = dag.sub_dag(
+                    task_regex=task_regex,
+                    include_downstream=downstream,
+                    include_upstream=upstream,
+                    )
+
+        tis = dag.clear(
+                start_date=start_date,
+                end_date=end_date,
+                only_failed=only_failed,
+                only_running=only_running,
+                include_subdags=not exclude_subdags,
+                )
+        if tis:
+            output = {
+                    'message': 'Here\'s the list of task instances you are ' \
+                            'about to clear',
+                    'detail': [t.to_json() for t in tis],
+                    }
+            return REST_API_Response_Util.get_200_response(base_response, output)
+        else:
+            error_message = "No task instances to clear"
+            logging.error(error_message)
+            return REST_API_Response_Util.get_400_error_response(
+                    base_response, error_message,
+                    )
+
+    def deploy_dag(self, base_response):
+        'Custom Function for the deploy_dag API'
+        logging.info("Executing custom 'deploy_dag' function")
+
+        dag_file = request.files['dag_file'] if 'dag_file' in request.files \
+                else None
+        force = True if request.form.get('force') is not None else False
+        pause = True if request.form.get('pause') is not None else False
+        unpause = True if request.form.get('unpause') is not None else False
+
+        try:
+            if dag_file is None or not request.files['dag_file'].filename:
+                raise AirflowException("The dag_file argument wasn't provided")
+
+            if dag_file and dag_file.filename.endswith(".py"):
+                save_file_path = os.path.join(
+                        airflow_dags_folder, dag_file.filename,
+                        )
+
+                # Check if the file already exists.
+                if os.path.isfile(save_file_path) and not force:
+                    logging.warning("File to upload already exists")
+                    s = "The file '{}' already exists on host '{}'".format(
+                            save_file_path, hostname ,
+                            )
+                    raise AirflowException(s)
+                else:
+                    logging.info("Saving file to '{}'".format(save_file_path))
+                    dag_file.save(save_file_path)
+            else:
+                s = "deploy_dag file is not a python file. It does not end " \
+                        "with a .py."
+                logging.warning(s)
+                raise AirflowException("dag_file is not a *.py file")
+
+            warning = None
+            # if both the pause and unpause options are provided then skip the pausing and unpausing phase
+            if pause and unpause:
+                warning = "Both options pause and unpause were given. Skipping" \
+                        "setting the state (pause, unpause) of the DAG."
+                logging.warning(warning)
+            elif pause or unpause:
+                try:
+                    # import the DAG file that was uploaded so that we can get 
+                    # the DAG_ID to execute the command to pause or unpause it
+                    import imp
+                    dag_file = imp.load_source('module.name', save_file_path)
+                    dag_id = dag_file.dag.dag_id
+
+                    # run the pause or unpause cli command
+                    airflow_cmd_split = []
+                    if pause:
+                        is_paused = True
+                    else:
+                        is_paused = False
+                    dag = self.set_is_paused(is_paused, dag_id)
+                except Exception as e:
+                    warning = "Failed to set the state (pause, unpause) of " \
+                            "the DAG: {}".format(e)
+                    logging.warning(warning)
+        except AirflowException as e:
+            error_message = str(e)
+            logging.error(error_message)
+            return REST_API_Response_Util.get_400_error_response(
+                    base_response, error_message,
+                    )
+        else:
+            return REST_API_Response_Util.get_200_response(
+                    base_response=base_response, 
+                    output="DAG File [{}] has been uploaded".format(dag_file),
+                    warning=warning,
+                    )
+
+    def refresh_dag(self, base_response):
+        ''' Custom Function for the refresh_dag API
+        This will call the direct function corresponding to the web endpoint '/admin/airflow/refresh' that already exists in Airflow
+        '''
+        logging.info("Executing custom 'refresh_dag' function")
+        dag_id = request.args.get('dag_id')
+        logging.info("dag_id to refresh: '" + str(dag_id) + "'")
+        if self.is_arg_not_provided(dag_id):
+            return REST_API_Response_Util.get_400_error_response(base_response, "dag_id should be provided")
+        elif " " in dag_id:
+            return REST_API_Response_Util.get_400_error_response(base_response, "dag_id contains spaces and is therefore an illegal argument")
+
+        try:
+            from airflow.www.views import Airflow
+            # NOTE: The request argument 'dag_id' is required for the refresh() function to get the dag_id
+            refresh_result = Airflow().refresh()
+            logging.info("Refresh Result: " + str(refresh_result))
+        except Exception as e:
+            error_message = "An error occurred while trying to Refresh the DAG '" + str(dag_id) + "': " + str(e)
+            logging.error(error_message)
+            return REST_API_Response_Util.get_500_error_response(base_response, error_message)
+
+        return REST_API_Response_Util.get_200_response(base_response=base_response, output="DAG [{}] is now fresh as a daisy".format(dag_id))
+
+
 
 # Creating View to be used by Plugin
 rest_api_view = REST_API(category="Admin", name="REST API Plugin")
