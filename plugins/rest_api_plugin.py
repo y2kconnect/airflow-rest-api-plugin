@@ -10,7 +10,7 @@ from airflow.api.common.experimental import trigger_dag as trigger
 from airflow.bin import cli
 from airflow.exceptions import AirflowException
 from airflow.executors import DEFAULT_EXECUTOR
-from airflow.models import DagBag, DagModel, DagRun, TaskInstance
+from airflow.models import DagBag, DagModel, DagRun, Pool, TaskInstance
 from airflow.plugins_manager import AirflowPlugin
 from airflow.ti_deps.dep_context import DepContext, QUEUE_DEPS, SCHEDULER_DEPS
 from airflow.www.app import csrf
@@ -768,9 +768,13 @@ class REST_API(BaseView):
         return REST_API_Response_Util.get_200_response(base_response, output)
 
     def pause(self, base_response):
+        'Pauses a DAG'
+        logging.info("Executing custom 'pause' function")
         return self._set_is_pause(base_response, True)
 
     def unpause(self, base_response):
+        'Unpauses a DAG'
+        logging.info("Executing custom 'unpause' function")
         return self._set_is_pause(base_response, False)
 
     def _set_is_pause(self, base_response, is_pause):
@@ -861,9 +865,8 @@ class REST_API(BaseView):
                 try:
                     execution_date = dateutil.parser.parse(execution_date)
                 except (ValueError, OverflowError):
-                    error_message = self.s_msg.format('execution',
-                            execution_date)
-                    raise AirflowException(error_message)
+                    msg = self.s_msg.format('execution', execution_date)
+                    raise AirflowException(msg)
             else:
                 execution_date = datetime.now()
             if not run_id:
@@ -880,6 +883,7 @@ class REST_API(BaseView):
                     output)
 
     def dag_state(self, base_response):
+        'Get the status of a dag run'
         logging.info("Executing custom 'dag_state' function")
 
         dag_id = request.args.get('dag_id')
@@ -892,8 +896,8 @@ class REST_API(BaseView):
             try:
                 execution_date = dateutil.parser.parse(execution_date)
             except (ValueError, OverflowError):
-                error_message = self.s_msg.format('execution', execution_date)
-                raise AirflowException(error_message)
+                msg = self.s_msg.format('execution', execution_date)
+                raise AirflowException(msg)
             dr = DagRun.find(dag_id, execution_date=execution_date)
             output = dr[0].state if len(dr) > 0 else None
         except AirflowException as e:
@@ -907,9 +911,6 @@ class REST_API(BaseView):
 
     def run(self, base_response):
         'Run a single task instance'
-        s_warn = 'The S3_LOG_FOLDER conf key has been replaced by ' \
-                'REMOTE_BASE_LOG_FOLDER. Your conf still works but please ' \
-                'update airflow.cfg to ensure future compatibility.'
         logging.info("Executing custom 'run_web' function")
 
         dag_id = request.args.get('dag_id')
@@ -930,6 +931,9 @@ class REST_API(BaseView):
         ship_dag = True if 'ship_dag' in request.args else False
         pickle = request.args.get('pickle')
 
+        s_warn = 'The S3_LOG_FOLDER conf key has been replaced by ' \
+                'REMOTE_BASE_LOG_FOLDER. Your conf still works but please ' \
+                'update airflow.cfg to ensure future compatibility.'
         try:
             if cfg_path and os.path.exists(cfg_path):
                 with open(cfg_path, 'r') as conf_file:
@@ -976,8 +980,8 @@ class REST_API(BaseView):
             try:
                 execution_date = dateutil.parser.parse(execution_date)
             except (ValueError, OverflowError):
-                error_message = self.s_msg.format('execution', execution_date)
-                raise AirflowException(error_message)
+                msg = self.s_msg.format('execution', execution_date)
+                raise AirflowException(msg)
             ti = TaskInstance(task, execution_date)
             ti.refresh_from_db()
 
@@ -1105,216 +1109,201 @@ class REST_API(BaseView):
                     output)
 
     def backfill(self, base_response):
-        pass
+        'Run subsections of a DAG for a specified date range'
+        logging.info("Executing custom 'backfill' function")
 
-        arr = set(request.args.keys())
         dag_id = request.args.get('dag_id')
         task_regex = request.args.get('task_regex')
         start_date = request.args.get('start_date')
         end_date = request.args.get('end_date')
-        mark_success = True if 'mark_success' in arr else False
-        local = True if 'local' in arr else False
-        donot_pickle = True if 'donot_pickle' in arr else False
-        include_adhoc = True if 'include_adhoc' in arr else False
-        ignore_dependencies = True if 'ignore_dependencies' in arr else False
+        mark_success = True if 'mark_success' in request.args else False
+        local = True if 'local' in request.args else False
+        donot_pickle = True if 'donot_pickle' in request.args else False
+        include_adhoc = True if 'include_adhoc' in request.args else False
+        ignore_dependencies = True if 'ignore_dependencies' in request.args \
+                else False
         ignore_first_depends_on_past = True if 'ignore_first_depends_on_past' \
-                in arr else False
+                in request.args else False
         subdir = request.args.get('subdir')
         pool = request.args.get('pool')
         dry_run = request.args.get('dry_run')
-        del arr
 
-        dagbag = DagBag(cli.process_subdir(subdir))
         try:
+            dagbag = DagBag(cli.process_subdir(subdir))
             if dag_id:
                 dag = dagbag.get_dag(dag_id)
-            elif ship_dag and pickle:
-                dag_pickle = session.query(DagPickle).filter(
-                        DagPickle.id == pickle,
-                        ).first()
-                if dag_pickle:
-                    dag = dag_pickle.pickle
-                else:
-                    msg = "Who hid the pickle!? [missing pickle]"
-                    raise AirflowException(msg)
             else:
                 msg = 'Who hid the dig_id!? [dag_id or pickle]'
                 raise AirflowException(msg)
-        except AirflowException as err:
-            error_message = str(err)
-            logging.error(error_message)
-            return REST_API_Response_Util.get_400_error_response(
-                    base_response, error_message,
-                    )
-
-        if start_date:
-            try:
-                start_date = dateutil.parser.parse(start_date)
-            except (ValueError, OverflowError):
-                error_message = (
-                        'Given start date, {}, could not be identified as a '
-                        'date. Example date format: 2015-11-16'.format(start_date)
+            if start_date:
+                try:
+                    start_date = dateutil.parser.parse(start_date)
+                except (ValueError, OverflowError):
+                    msg = self.s_msg.format('start', start_date)
+                    raise AirflowException(msg)
+            if end_date:
+                try:
+                    end_date = dateutil.parser.parse(end_date)
+                except (ValueError, OverflowError):
+                    msg = self.s_msg.format('end', end_date)
+                    raise AirflowException(msg)
+            if not (start_date or end_date):
+                msg = "Provide a start_date and/or end_date"
+                raise AirflowException(msg)
+            else:
+                # If only one date is passed, using same as start and end
+                end_date = end_date or start_date
+                start_date = start_date or end_date
+            if task_regex:
+                dag = dag.sub_dag(
+                        task_regex=args.task_regex,
+                        include_upstream=not ignore_dependencies,
                         )
-                logging.error(error_message)
-                return REST_API_Response_Util.get_400_error_response(
-                        base_response, error_message,
-                        )
-
-        if end_date:
-            try:
-                end_date = dateutil.parser.parse(end_date)
-            except (ValueError, OverflowError):
-                error_message = (
-                        'Given end date, {}, could not be identified as a date.'
-                        'Example date format: 2015-11-16'.format(end_date)
-                        )
-                logging.error(error_message)
-                return REST_API_Response_Util.get_400_error_response(
-                        base_response, error_message,
-                        )
-
-        if not args.start_date and not args.end_date:
-            error_message = "Provide a start_date and/or end_date"
-            logging.error(error_message)
-            return REST_API_Response_Util.get_400_error_response(
-                    base_response, error_message,
-                    )
-        else:
-            # If only one date is passed, using same as start and end
-            end_date = end_date or start_date
-            start_date = start_date or end_date
-
-        if task_regex:
-            dag = dag.sub_dag(
-                    task_regex=args.task_regex,
-                    include_upstream=not ignore_dependencies,
-                    )
-
-        if dry_run:
-            msg = "Dry run of DAG {0} on {1}".format(dag_id, start_date)
-            loggin.info(msg)
-            for task in dag.tasks:
-                msg = "Task {0}".format(task.task_id)
+            if dry_run:
+                msg = "Dry run of DAG {0} on {1}".format(dag_id, start_date)
                 loggin.info(msg)
-                ti = TaskInstance(task, args.start_date)
-                ti.dry_run()
+                for task in dag.tasks:
+                    msg = "Task {0}".format(task.task_id)
+                    loggin.info(msg)
+                    ti = TaskInstance(task, args.start_date)
+                    ti.dry_run()
+            else:
+                dag.run(
+                        start_date=start_date,
+                        end_date=end_date,
+                        mark_success=mark_success,
+                        include_adhoc=include_adhoc,
+                        local=local,
+                        donot_pickle=(
+                                donot_pickle
+                                or configuration.getboolean('core', 'donot_pickle')
+                                ),
+                        ignore_first_depends_on_past=ignore_first_depends_on_past,
+                        ignore_task_deps=ignore_dependencies,
+                        pool=pool,
+                        )
+            output = dag.to_json()
+        except AirflowException as e:
+            error_message = str(e)
+            logging.error(error_message)
+            return REST_API_Response_Util.get_400_error_response(base_response,
+                    error_message)
         else:
-            dag.run(
-                    start_date=start_date,
-                    end_date=end_date,
-                    mark_success=mark_success,
-                    include_adhoc=include_adhoc,
-                    local=local,
-                    donot_pickle=(
-                            donot_pickle
-                            or conf.getboolean('core', 'donot_pickle')
-                            ),
-                    ignore_first_depends_on_past=ignore_first_depends_on_past,
-                    ignore_task_deps=ignore_dependencies,
-                    pool=pool,
-                    )
-        output = 'Finish'
-        return REST_API_Response_Util.get_200_response(base_response, output)
+            return REST_API_Response_Util.get_200_response(base_response,
+                    output)
 
     def list_dags(self, base_response):
+        'List all the DAGs'
+        logging.info("Executing custom 'list_dags' function")
+
         subdir = request.args.get('subdir')
-        dagbag = DagBag(cli.process_subdir(subdir))
-        output = sorted(dagbag.dags)
-        return REST_API_Response_Util.get_200_response(base_response, output)
+
+        try:
+            dagbag = DagBag(cli.process_subdir(subdir))
+            output = sorted(dagbag.dags)
+        except AirflowException as e:
+            logging.error(error_message)
+            return REST_API_Response_Util.get_400_error_response(base_response,
+                    error_message)
+        else:
+            return REST_API_Response_Util.get_200_response(base_response,
+                    output)
 
     def task_state(self, base_response):
+        'Get the status of a task instance'
+        logging.info("Executing custom 'task_state' function")
+
         dag_id = request.args.get('dag_id')
         task_id = request.args.get('task_id')
         execution_date = request.args.get('execution_date')
         subdir = request.args.get('subdir')
 
-        dagbag = DagBag(cli.process_subdir(subdir))
         try:
+            dagbag = DagBag(cli.process_subdir(subdir))
             if dag_id:
                 dag = dagbag.get_dag(dag_id)
             else:
-                msg = 'Who hid the dig_id!?'
-                raise AirflowException(msg)
-        except AirflowException as err:
-            error_message = str(err)
+                raise AirflowException('Who hid the dig_id!?')
+            task = dag.get_task(task_id=task_id)
+            try:
+                execution_date = dateutil.parser.parse(execution_date)
+            except (ValueError, OverflowError):
+                raise AirflowException(self.s_msg.format(
+                        'execution', execution_date))
+            ti = TaskInstance(task, execution_date)
+            output = ti.current_state()
+        except AirflowException as e:
+            error_message = str(e)
             logging.error(error_message)
-            return REST_API_Response_Util.get_400_error_response(
-                    base_response, error_message,
-                    )
-        task = dag.get_task(task_id=task_id)
-
-        try:
-            execution_date = dateutil.parser.parse(execution_date)
-        except (ValueError, OverflowError):
-            error_message = (
-                    'Given execution date, {}, could not be identified as '
-                    'a date. Example date format: 2015-11-16T14:34:15 or '
-                    '2015-11-16T14:34:15+08:00'.format(execution_date)
-                    )
-            logging.error(error_message)
-            return REST_API_Response_Util.get_400_error_response(
-                    base_response, error_message,
-                    )
-
-        ti = TaskInstance(task, execution_date)
-        output = ti.current_state()
-        return REST_API_Response_Util.get_200_response(base_response, output)
+            return REST_API_Response_Util.get_400_error_response(base_response,
+                    error_message)
+        else:
+            return REST_API_Response_Util.get_200_response(base_response,
+                    output)
 
     def pool(self, base_response):
+        'CRUD operations on pools'
+        logging.info("Executing custom 'pool' function")
+
         args_set = request.args.get('set')
         args_get = request.args.get('get')
         args_delete = request.args.get('delete')
 
-        session = settings.Session()
-        qs = session.query(Pool)
-        if args_set:
-            # set
-            name, slot_count, pool_description = args_set.split()
-            pool = qs.filter_by(pool=name).first()
-            flag_dirty = False
-            if pool is None:
-                pool = Pool(
-                        pool=name,
-                        slots=slot_count,
-                        description=pool_description,
-                        )
-                flag_dirty = True
-            else:
-                if pool.slots != slot_count:
-                    pool.slots = slot_count
+        try:
+            session = settings.Session()
+            qs = session.query(Pool)
+            if args_set:
+                # 设置
+                name, slot_count, pool_description = args_set.split()
+                pool = qs.filter_by(pool=name).first()
+                flag_dirty = False
+                if pool:
+                    if pool.slots != slot_count:
+                        pool.slots = slot_count
+                        flag_dirty = True
+                    if pool.description != pool_description:
+                        pool.description = pool_description
+                        flag_dirty = True
+                else:
+                    pool = Pool(
+                            pool=name,
+                            slots=slot_count,
+                            description=pool_description,
+                            )
                     flag_dirty = True
-                if pool.description != pool_description:
-                    pool.description = pool_description
-                    flag_dirty = True
-            if flag_dirty:
-                session.add(pool)
-                session.commit()
-            output = pool.to_json()
-        elif args_get:
-            # get
-            pool = qs.filter_by(pool=args_get).first()
-            if pool is None:
-                error_message = 'The {} record does not exist'.format(args_get)
-                logging.error(error_message)
-                return REST_API_Response_Util.get_400_error_response(
-                        base_response, error_message,
-                        )
-            else:
+                if flag_dirty:
+                    session.add(pool)
+                    session.commit()
                 output = pool.to_json()
-        else:
-            # delete
-            pool = qs.filter_by(pool=args_delete).first()
-            if pool is None:
-                error_message = 'The {} record does not exist'.format(args_get)
-                logging.error(error_message)
-                return REST_API_Response_Util.get_400_error_response(
-                        base_response, error_message,
-                        )
+            elif args_get:
+                # 浏览
+                pool = qs.filter_by(pool=args_get).first()
+                if pool:
+                    output = pool.to_json()
+                else:
+                    msg = 'The "{}" record does not exist'.format(args_get)
+                    raise AirflowException(msg)
+            elif args_delete:
+                # 删除
+                pool = qs.filter_by(pool=args_delete).first()
+                if pool:
+                    qs.filter_by(pool=args_delete).delete()
+                    session.commit()
+                    output = 'The "{}" record has been deleted'.format(
+                            args_delete)
+                else:
+                    msg = 'The "{}" record does not exist'.format(args_delete)
+                    raise AirflowException(msg)
             else:
-                qs.filter_by(pool=args_delete).delete()
-                session.commit()
-                output = 'The record has been deleted'
-        return REST_API_Response_Util.get_200_response(base_response, output)
+                raise AirflowException('No pool named found')
+        except AirflowException as e:
+            error_message = str(e)
+            logging.error(error_message)
+            return REST_API_Response_Util.get_400_error_response(base_response,
+                    error_message)
+        else:
+            return REST_API_Response_Util.get_200_response(base_response,
+                    output)
 
     def clear(self, base_response):
         pass
