@@ -767,6 +767,12 @@ class REST_API(BaseView):
         output = "v" + rest_api_plugin_version
         return REST_API_Response_Util.get_200_response(base_response, output)
 
+    # def variables(self, base_response):
+    #     pass
+
+    # def connections(self, base_response):
+    #     pass
+
     def pause(self, base_response):
         'Pauses a DAG'
         logging.info("Executing custom 'pause' function")
@@ -881,6 +887,49 @@ class REST_API(BaseView):
         else:
             return REST_API_Response_Util.get_200_response(base_response,
                     output)
+
+    def test(self, base_response):
+        ''' Test a task instance.
+        This will run a task without checking for dependencies or recording
+        it's state in the database.
+        '''
+        logging.info("Executing custom 'test' function")
+
+        dag_id = request.args.get('dag_id')
+        task_id = request.args.get('task_id')
+        execution_date = request.args.get('execution_date')
+        subdir = request.args.get('subdir')
+        dry_run = True if 'dry_run' in request.args else False
+        task_params = request.args.get('task_params')
+
+        try:
+            dagbag = DagBag(cli.process_subdir(subdir))
+            dag = dagbag.get_dag(dag_id)
+            task = dag.get_task(task_id=task_id)
+            try:
+                execution_date = dateutil.parser.parse(execution_date)
+            except (ValueError, OverflowError):
+                msg = self.s_msg.format('execution', execution_date)
+                raise AirflowException(msg)
+            ti = TaskInstance(task, execution_date)
+            if dry_run:
+                ti.dry_run()
+            else:
+                ti.run(
+                        ignore_task_deps=True,
+                        ignore_ti_state=True,
+                        test_mode=True,
+                        )
+            output = ti.to_json()
+        except AirflowException as e:
+            error_message = str(e)
+            logging.error(error_message)
+            return REST_API_Response_Util.get_400_error_response(base_response,
+                    error_message)
+        else:
+            return REST_API_Response_Util.get_200_response(base_response,
+                    output)
+
 
     def dag_state(self, base_response):
         'Get the status of a dag run'
