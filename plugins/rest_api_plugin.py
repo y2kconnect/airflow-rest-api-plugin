@@ -1306,90 +1306,71 @@ class REST_API(BaseView):
                     output)
 
     def clear(self, base_response):
-        pass
-        arr = set(request.args.keys())
+        'Clear a set of task instance, as if they never ran'
+        logging.info("Executing custom 'clear' function")
+
         dag_id = request.args.get('dag_id')
         task_regex = request.args.get('task_regex')
         start_date = request.args.get('start_date')
         end_date = request.args.get('end_date')
         subdir = request.args.get('subdir')
-        upstream = True if 'upstream' in arr else False
-        downstream = True if 'downstream' in arr else False
-        only_failed = True if 'only_failed' in arr else False
-        only_running = True if 'only_running' in arr else False
-        exclude_subdags = True if 'exclude_subdags' in arr else False
-        del arr
+        upstream = True if 'upstream' in request.args else False
+        downstream = True if 'downstream' in request.args else False
+        only_failed = True if 'only_failed' in request.args else False
+        only_running = True if 'only_running' in request.args else False
+        exclude_subdags = True if 'exclude_subdags' in request.args else False
 
-        dagbag = DagBag(cli.process_subdir(subdir))
         try:
+            dagbag = DagBag(cli.process_subdir(subdir))
             if dag_id:
                 dag = dagbag.get_dag(dag_id)
             else:
-                msg = 'Who hid the dig_id!? [dag_id or pickle]'
-                raise AirflowException(msg)
-        except AirflowException as err:
-            error_message = str(err)
+                raise AirflowException('Who hid the dig_id!?')
+            if start_date:
+                try:
+                    start_date = dateutil.parser.parse(start_date).date()
+                except (ValueError, OverflowError):
+                    raise AirflowException(self.s_msg.format('start',
+                            start_date))
+            if end_date:
+                try:
+                    end_date = dateutil.parser.parse(end_date)
+                except (ValueError, OverflowError):
+                    raise AirflowException(self.s_msg.format('end_date',
+                            end_date))
+            if task_regex:
+                dag = dag.sub_dag(
+                        task_regex=task_regex,
+                        include_downstream=downstream,
+                        include_upstream=upstream,
+                        )
+            tis = dag.clear(
+                    start_date=start_date,
+                    end_date=end_date,
+                    only_failed=only_failed,
+                    only_running=only_running,
+                    include_subdags=not exclude_subdags,
+                    dry_run=True,
+                    )
+            if tis:
+                output = {
+                        'message': "Here's the list of task instances you are" \
+                                " about to clear",
+                        'details': [t.to_json() for t in tis],
+                        }
+            else:
+                raise AirflowException("No task instances to clear")
+        except AirflowException as e:
+            error_message = str(e)
             logging.error(error_message)
-            return REST_API_Response_Util.get_400_error_response(
-                    base_response, error_message,
-                    )
-
-        if start_date:
-            try:
-                start_date = dateutil.parser.parse(start_date).date()
-            except (ValueError, OverflowError):
-                error_message = (
-                        'Given start date, {}, could not be identified as a '
-                        'date. Example date format: 2015-11-16'.format(start_date)
-                        )
-                logging.error(error_message)
-                return REST_API_Response_Util.get_400_error_response(
-                        base_response, error_message,
-                        )
-
-        if end_date:
-            try:
-                end_date = dateutil.parser.parse(end_date)
-            except (ValueError, OverflowError):
-                error_message = (
-                        'Given end date, {}, could not be identified as a date.'
-                        'Example date format: 2015-11-16'.format(end_date)
-                        )
-                logging.error(error_message)
-                return REST_API_Response_Util.get_400_error_response(
-                        base_response, error_message,
-                        )
-
-        if task_regex:
-            dag = dag.sub_dag(
-                    task_regex=task_regex,
-                    include_downstream=downstream,
-                    include_upstream=upstream,
-                    )
-
-        tis = dag.clear(
-                start_date=start_date,
-                end_date=end_date,
-                only_failed=only_failed,
-                only_running=only_running,
-                include_subdags=not exclude_subdags,
-                )
-        if tis:
-            output = {
-                    'message': 'Here\'s the list of task instances you are ' \
-                            'about to clear',
-                    'detail': [t.to_json() for t in tis],
-                    }
-            return REST_API_Response_Util.get_200_response(base_response, output)
+            return REST_API_Response_Util.get_400_error_response(base_response,
+                    error_message)
         else:
-            error_message = "No task instances to clear"
-            logging.error(error_message)
-            return REST_API_Response_Util.get_400_error_response(
-                    base_response, error_message,
-                    )
+            return REST_API_Response_Util.get_200_response(base_response,
+                    output)
 
     def deploy_dag(self, base_response):
-        'Custom Function for the deploy_dag API'
+        'Deploy a new DAG File to the DAGs directory'
         logging.info("Executing custom 'deploy_dag' function")
 
         dag_file = request.files['dag_file'] if 'dag_file' in request.files \
@@ -1401,18 +1382,15 @@ class REST_API(BaseView):
         try:
             if dag_file is None or not request.files['dag_file'].filename:
                 raise AirflowException("The dag_file argument wasn't provided")
-
             if dag_file and dag_file.filename.endswith(".py"):
                 save_file_path = os.path.join(
                         airflow_dags_folder, dag_file.filename,
                         )
-
                 # Check if the file already exists.
                 if os.path.isfile(save_file_path) and not force:
                     logging.warning("File to upload already exists")
                     s = "The file '{}' already exists on host '{}'".format(
-                            save_file_path, hostname ,
-                            )
+                            save_file_path, hostname)
                     raise AirflowException(s)
                 else:
                     logging.info("Saving file to '{}'".format(save_file_path))
@@ -1451,9 +1429,8 @@ class REST_API(BaseView):
         except AirflowException as e:
             error_message = str(e)
             logging.error(error_message)
-            return REST_API_Response_Util.get_400_error_response(
-                    base_response, error_message,
-                    )
+            return REST_API_Response_Util.get_400_error_response(base_response,
+                    error_message)
         else:
             return REST_API_Response_Util.get_200_response(
                     base_response=base_response, 
@@ -1462,28 +1439,44 @@ class REST_API(BaseView):
                     )
 
     def refresh_dag(self, base_response):
-        ''' Custom Function for the refresh_dag API
-        This will call the direct function corresponding to the web endpoint '/admin/airflow/refresh' that already exists in Airflow
-        '''
+        'Refresh a DAG in the Web Server'
         logging.info("Executing custom 'refresh_dag' function")
+
         dag_id = request.args.get('dag_id')
-        logging.info("dag_id to refresh: '" + str(dag_id) + "'")
-        if self.is_arg_not_provided(dag_id):
-            return REST_API_Response_Util.get_400_error_response(base_response, "dag_id should be provided")
-        elif " " in dag_id:
-            return REST_API_Response_Util.get_400_error_response(base_response, "dag_id contains spaces and is therefore an illegal argument")
 
         try:
-            from airflow.www.views import Airflow
-            # NOTE: The request argument 'dag_id' is required for the refresh() function to get the dag_id
-            refresh_result = Airflow().refresh()
-            logging.info("Refresh Result: " + str(refresh_result))
-        except Exception as e:
-            error_message = "An error occurred while trying to Refresh the DAG '" + str(dag_id) + "': " + str(e)
+            if self.is_arg_not_provided(dag_id):
+                raise AirflowException("dag_id should be provided")
+            elif " " in dag_id:
+                s = "dag_id contains spaces and is therefore an illegal argument"
+                raise AirflowException(s)
+            try:
+                session = settings.Session()
+                orm_dag = session.query(DagModel).filter(
+                        DagModel.dag_id == dag_id,
+                        ).first()
+                if orm_dag:
+                    orm_dag.last_expired = datetime.now()
+                    session.merge(orm_dag)
+                session.commit()
+                detail = orm_dag.to_json()
+                session.close()
+            except Exception as e:
+                s = "An error occurred while trying to Refresh the DAG '{}': {}"
+                raise AirflowException(s.format(dag_id, e))
+            output = {
+                    'message': "DAG [{}] is now fresh as a daisy".format(dag_id),
+                    'detail': detail,
+                    }
+            logging.info(output)
+        except AirflowException as e:
+            error_message = str(e)
             logging.error(error_message)
-            return REST_API_Response_Util.get_500_error_response(base_response, error_message)
-
-        return REST_API_Response_Util.get_200_response(base_response=base_response, output="DAG [{}] is now fresh as a daisy".format(dag_id))
+            return REST_API_Response_Util.get_400_error_response(base_response,
+                    error_message)
+        else:
+            return REST_API_Response_Util.get_200_response(base_response,
+                    output)
 
 
 
@@ -1509,3 +1502,4 @@ class REST_API_Plugin(AirflowPlugin):
     executors = []
     admin_views = [rest_api_view]
     menu_links = []
+
