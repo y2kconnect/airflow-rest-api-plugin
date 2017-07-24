@@ -10,7 +10,9 @@ from airflow.api.common.experimental import trigger_dag as trigger
 from airflow.bin import cli
 from airflow.exceptions import AirflowException
 from airflow.executors import DEFAULT_EXECUTOR
-from airflow.models import DagBag, DagModel, DagRun, Pool, TaskInstance
+from airflow.models import (
+        DagBag, DagModel, DagRun, Pool, TaskInstance, Variable,
+        )
 from airflow.plugins_manager import AirflowPlugin
 from airflow.ti_deps.dep_context import DepContext, QUEUE_DEPS, SCHEDULER_DEPS
 from airflow.www.app import csrf
@@ -767,8 +769,74 @@ class REST_API(BaseView):
         output = "v" + rest_api_plugin_version
         return REST_API_Response_Util.get_200_response(base_response, output)
 
-    # def variables(self, base_response):
-    #     pass
+    def variables(self, base_response):
+        'CRUD operations on variables'
+        logging.info("Executing custom 'variables' function")
+
+        args_set = request.args.get('set')
+        args_get = request.args.get('get')
+        args_json = True if 'json' in request.args else None
+        args_default = request.args.get('default')
+        args_import = request.args.get('import')
+        args_export = request.args.get('export')
+        args_delete = request.args.get('delete')
+
+        output = {}
+        try:
+            session = settings.Session()
+            qs = session.query(Variable)
+            if args_get:
+                # 浏览
+                var = Variable.get(
+                        args_get,
+                        deserialize_json=args_json,
+                        default_var=args_default,
+                        )
+                output['get'] = {args_get: var}
+            if args_delete:
+                # 删除
+                qs.filter_by(key=args_delete).delete()
+                session.commit()
+                output['delete'] = 'The "{}" variable has been deleted'.format(
+                        args_delete)
+            if args_set:
+                # 设置
+                sep = ' '
+                arr = args_set.split() if sep in args_set else [args_set]
+                key = arr[0]
+                value = sep.join(arr[1:]) if 1 < len(arr) else None
+                Variable.set(key, value)
+                obj = qs.filter_by(key=key).first()
+                output['set'] = obj.to_json() if obj else None
+            if args_import:
+                if os.path.exists(args_import):
+                    import_helper(args_import)
+                    output['import'] = 'The "{}" file successfully loads.' \
+                            .format(args_import)
+                else:
+                    raise AirflowException("Missing variables file.")
+            if args_export:
+                cli.export_helper(args_export)
+                output['export'] = 'The "{}" file successfully write.' \
+                            .format(args_export)
+            if not (
+                    args_set
+                    or args_get
+                    or args_import
+                    or args_export
+                    or args_delete
+                    ):
+                # list all variables
+                output['all'] = [var.to_json() for var in qs]
+        except AirflowException as e:
+            error_message = str(e)
+            logging.error(error_message)
+            return REST_API_Response_Util.get_400_error_response(base_response,
+                    error_message)
+        else:
+            return REST_API_Response_Util.get_200_response(base_response,
+                    output)
+
 
     # def connections(self, base_response):
     #     pass
