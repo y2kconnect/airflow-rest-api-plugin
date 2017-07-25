@@ -5,6 +5,7 @@ __version__ = "1.0.3"
 # python apps
 import dateutil.parser
 import imp
+import json
 import logging
 import os
 import reprlib
@@ -916,8 +917,8 @@ class REST_API(BaseView):
                     ]
             if missing_args:
                 msg = 'The following args are required to add a ' \
-                        'connection: {missing!r}'
-                raise AirflowException(msg.format(missing=missing_args))
+                        'connection: {missing!r}'.format(missing=missing_args)
+                raise AirflowException(msg)
             new_conn = Connection(conn_id=conn_id, uri=conn_uri)
             if conn_extra is not None:
                 new_conn.set_extra(conn_extra)
@@ -1017,18 +1018,21 @@ class REST_API(BaseView):
             try:
                 execution_date = dateutil.parser.parse(execution_date)
             except (ValueError, OverflowError):
-                raise AirflowException(self.s_msg.format(
-                        'execution', execution_date))
+                msg = self.s_msg.format('execution', execution_date)
+                raise AirflowException(msg)
             ti = TaskInstance(task, execution_date)
             dep_context = DepContext(deps=SCHEDULER_DEPS)
             failed_deps = list(ti.get_failed_dep_statuses(dep_context=
                     dep_context))
             if failed_deps:
-                info = {dep.dep_name: dep.reason for dep in failed_deps}
-                raise AirflowException(info)
+                info_error = {dep.dep_name: dep.reason for dep in failed_deps}
+                raise AirflowException('flag_failed_deps')
             output = "Task instance dependencies are all met."
         except AirflowException as e:
             error_message = str(e)
+            # 特例
+            if error_message == 'flag_failed_deps':
+                error_message = info_error
             logging.error(error_message)
             return REST_API_Response_Util.get_400_error_response(base_response,
                     error_message)
@@ -1604,14 +1608,14 @@ class REST_API(BaseView):
                 try:
                     start_date = dateutil.parser.parse(start_date).date()
                 except (ValueError, OverflowError):
-                    raise AirflowException(self.s_msg.format('start',
-                            start_date))
+                    msg = self.s_msg.format('start', start_date)
+                    raise AirflowException(msg)
             if end_date:
                 try:
                     end_date = dateutil.parser.parse(end_date)
                 except (ValueError, OverflowError):
-                    raise AirflowException(self.s_msg.format('end_date',
-                            end_date))
+                    msg = self.s_msg.format('end_date', end_date)
+                    raise AirflowException(msg)
             return start_date, end_date
 
         try:
