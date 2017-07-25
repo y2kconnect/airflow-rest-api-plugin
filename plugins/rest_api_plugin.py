@@ -1190,8 +1190,9 @@ class REST_API(BaseView):
                     level=settings.LOGGING_LEVEL,
                     format=settings.LOG_FORMAT,
                     )
+            return filename, log_base
 
-        def func_TackInstance():
+        def func_TackInstance(execution_date):
             dagbag = DagBag(cli.process_subdir(subdir))
             if dag_id:
                 dag = dagbag.get_dag(dag_id)
@@ -1265,7 +1266,7 @@ class REST_API(BaseView):
             executor.heartbeat()
             executor.end()
 
-        def func_remote():
+        def func_remote(filename, log_base):
             logging.root.handlers[0].flush()
             logging.root.handlers = []
             # store logs remotely
@@ -1297,13 +1298,13 @@ class REST_API(BaseView):
         try:
             session = settings.Session()
             func_cfg_path()
-            func_logging()
-            ti = func_TackInstance()
+            f_name, log_base = func_logging()
+            ti = func_TackInstance(execution_date)
             if local:
                 func_local()
             else:
                 func_no_local()
-            func_remote()
+            func_remote(f_name, log_base)
             s = 'Sent {} to the message queue, it should start any moment now.'
             output = {
                     'message': s.format(ti),
@@ -1392,6 +1393,7 @@ class REST_API(BaseView):
                         task_regex=task_regex,
                         include_upstream=not ignore_dependencies,
                         )
+            print('type(dag): {}\n\tdag: {}'.format(type(dag), dag))
             return dag
 
         def func_date(start_date, end_date):
@@ -1441,7 +1443,7 @@ class REST_API(BaseView):
                         ignore_task_deps=ignore_dependencies,
                         pool=pool,
                         )
-            output = dag.to_json()
+            output = 'Runs the DAG: {}'.format(dag.dag_id)
         except AirflowException as e:
             error_message = str(e)
             logging.error(error_message)
