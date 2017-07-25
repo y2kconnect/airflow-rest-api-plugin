@@ -528,7 +528,6 @@ class REST_API(BaseView):
     s_msg = 'Given {} date, {}, could not be identified as a date. Example ' \
             'date format: 2015-11-16T14:34:15 or 2015-11-16T14:34:15+08:00'
 
-
     # Checks a string object to see if it is none or empty so we can determine if an argument (passed to the rest api) is provided
     @staticmethod
     def is_arg_not_provided(arg):
@@ -1037,7 +1036,6 @@ class REST_API(BaseView):
             return REST_API_Response_Util.get_200_response(base_response,
                     output)
 
-    # Custom function for the trigger_dag API
     def trigger_dag(self, base_response):
         'Trigger a DAG run'
         logging.info("Executing custom 'trigger_dag' function")
@@ -1142,10 +1140,6 @@ class REST_API(BaseView):
         'Run a single task instance'
         logging.info("Executing custom 'run_web' function")
 
-        s_warn = 'The S3_LOG_FOLDER conf key has been replaced by ' \
-                'REMOTE_BASE_LOG_FOLDER. Your conf still works but please ' \
-                'update airflow.cfg to ensure future compatibility.'
-
         dag_id = request.args.get('dag_id')
         task_id = request.args.get('task_id')
         execution_date = request.args.get('execution_date')
@@ -1162,9 +1156,9 @@ class REST_API(BaseView):
         ignore_depends_on_past = True if 'ignore_depends_on_past' in \
                 request.args else False
         ship_dag = True if 'ship_dag' in request.args else False
-        pickle = request.args.get('pickle')
+        pickle_id = request.args.get('pickle')
 
-        try:
+        def func_cfg_path():
             if cfg_path and os.path.exists(cfg_path):
                 with open(cfg_path, 'r') as conf_file:
                    conf_dict = json.load(conf_file)
@@ -1173,6 +1167,9 @@ class REST_API(BaseView):
                         configuration.set(section, option, value)
                 settings.configure_vars()
                 settings.configure_orm()
+
+        def func_logging():
+            global logging
 
             logging.root.handlers = []
             log_base = os.path.expanduser(configuration.get('core',
@@ -1190,21 +1187,21 @@ class REST_API(BaseView):
                     format=settings.LOG_FORMAT,
                     )
 
-            session = settings.Session()
+        def func_TackInstance():
             dagbag = DagBag(cli.process_subdir(subdir))
             if dag_id:
                 dag = dagbag.get_dag(dag_id)
-            elif ship_dag and pickle:
+            elif ship_dag and pickle_id:
                 dag_pickle = session.query(DagPickle).filter(
-                        DagPickle.id == pickle,
+                        DagPickle.id == pickle_id,
                         ).first()
                 if dag_pickle:
                     dag = dag_pickle.pickle
                 else:
-                    msg = "Who hid the pickle!? [missing pickle]"
+                    msg = "Who hid the pickle_id!? [missing pickle_id]"
                     raise AirflowException(msg)
             else:
-                msg = 'Who hid the dig_id!? [dag_id or pickle]'
+                msg = 'Who hid the dig_id!? [dag_id or pickle_id]'
                 raise AirflowException(msg)
             task = dag.get_task(task_id=task_id)
             try:
@@ -1214,60 +1211,68 @@ class REST_API(BaseView):
                 raise AirflowException(msg)
             ti = TaskInstance(task, execution_date)
             ti.refresh_from_db()
+            return ti
 
-            if local:
-                logging.info('Logging into: {}'.format(filename))
-                run_job = jobs.LocalTaskJob(
-                        task_instance=ti,
-                        mark_success=mark_success,
-                        pickle_id=pickle,
-                        ignore_all_deps=ignore_all_dependencies,
-                        ignore_depends_on_past=ignore_depends_on_past,
-                        ignore_task_deps=ignore_dependencies,
-                        ignore_ti_state=force,
-                        pool=pool,
-                        )
-                run_job.run()
-            else:
-                pickle_id = None
-                if ship_dag:
-                    try:
-                        # Running remotely, so pickling the DAG
-                        pickle = DagPickle(dag)
-                        session.add(pickle)
-                        session.commit()
-                        pickle_id = pickle.id
-                        msg = 'Pickled dag {dag} as pickle_id:{pickle_id}' \
-                                .format(dag, pickle_id)
-                        logging.info(msg)
-                    except Exception as e:
-                        error_message = 'Could not pickle the DAG, {}'.format(e)
-                        logging.error(error_message)
-                        return REST_API_Response_Util.get_400_error_response(
-                                base_response, error_message,
-                                )
-                executor = DEFAULT_EXECUTOR
-                executor.start()
-                logging.info('Sending to executor.')
-                executor.queue_task_instance(
-                        ti,
-                        mark_success=mark_success,
-                        pickle_id=pickle_id,
-                        ignore_all_deps=ignore_all_dependencies,
-                        ignore_depends_on_past=ignore_depends_on_past,
-                        ignore_task_deps=ignore_dependencies,
-                        ignore_ti_state=force,
-                        pool=pool,
-                        )
-                executor.heartbeat()
-                executor.end()
+        def func_local():
+            logging.info('Logging into: {}'.format(filename))
+            run_job = jobs.LocalTaskJob(
+                    task_instance=ti,
+                    mark_success=mark_success,
+                    pickle_id=pickle_id,
+                    ignore_all_deps=ignore_all_dependencies,
+                    ignore_depends_on_past=ignore_depends_on_past,
+                    ignore_task_deps=ignore_dependencies,
+                    ignore_ti_state=force,
+                    pool=pool,
+                    )
+            run_job.run()
+
+        def func_no_local():
+            pickle_id = None
+            if ship_dag:
+                try:
+                    # Running remotely, so pickling the DAG
+                    pickle = DagPickle(dag)
+                    session.add(pickle)
+                    session.commit()
+                    pickle_id = pickle.id
+                    msg = 'Pickled dag {dag} as pickle_id:{pickle_id}' \
+                            .format(dag, pickle_id)
+                    logging.info(msg)
+                except Exception as e:
+                    error_message = 'Could not pickle the DAG, {}'.format(e)
+                    logging.error(error_message)
+                    return REST_API_Response_Util.get_400_error_response(
+                            base_response, error_message,
+                            )
+            executor = DEFAULT_EXECUTOR
+            executor.start()
+            logging.info('Sending to executor.')
+            executor.queue_task_instance(
+                    ti,
+                    mark_success=mark_success,
+                    pickle_id=pickle_id,
+                    ignore_all_deps=ignore_all_dependencies,
+                    ignore_depends_on_past=ignore_depends_on_past,
+                    ignore_task_deps=ignore_dependencies,
+                    ignore_ti_state=force,
+                    pool=pool,
+                    )
+            executor.heartbeat()
+            executor.end()
+
+        def func_remote():
             logging.root.handlers[0].flush()
             logging.root.handlers = []
             # store logs remotely
             remote_base = configuration.get('core', 'REMOTE_BASE_LOG_FOLDER')
             # deprecated as of March 2016
             if not remote_base and configuration.get('core', 'S3_LOG_FOLDER'):
-                warnings.warn(s_warn, DeprecationWarning)
+                msg = 'The S3_LOG_FOLDER conf key has been replaced by ' \
+                        'REMOTE_BASE_LOG_FOLDER. Your conf still works but ' \
+                        'please update airflow.cfg to ensure future ' \
+                        'compatibility.'
+                warnings.warn(msg, DeprecationWarning)
                 remote_base = configuration.get('core', 'S3_LOG_FOLDER')
             if os.path.exists(filename):
                 # read log and remove old logs to get just the latest additions
@@ -1284,9 +1289,20 @@ class REST_API(BaseView):
                 elif remote_base and remote_base != 'None':
                     logging.error('Unsupported remote log location: {}'.format(
                             remote_base))
+
+        try:
+            session = settings.Session()
+            func_cfg_path()
+            func_logging()
+            ti = func_TackInstance()
+            if local:
+                func_local()
+            else:
+                func_no_local()
+            func_remote()
+            s = 'Sent {} to the message queue, it should start any moment now.'
             output = {
-                    'message': 'Sent {} to the message queue, it should start' \
-                            ' any moment now.'.format(ti),
+                    'message': s.format(ti),
                     'detail': ti.to_json(),
                     }
         except AirflowException as e:
@@ -1297,6 +1313,8 @@ class REST_API(BaseView):
         else:
             return REST_API_Response_Util.get_200_response(base_response,
                     output)
+        finally:
+            session.close()
 
     def list_tasks(self, base_response):
         'List the tasks within a DAG'
@@ -1358,13 +1376,21 @@ class REST_API(BaseView):
         pool = request.args.get('pool')
         dry_run = request.args.get('dry_run')
 
-        try:
+        def func_dag():
             dagbag = DagBag(cli.process_subdir(subdir))
             if dag_id:
                 dag = dagbag.get_dag(dag_id)
             else:
                 msg = 'Who hid the dig_id!? [dag_id or pickle]'
                 raise AirflowException(msg)
+            if task_regex:
+                dag = dag.sub_dag(
+                        task_regex=task_regex,
+                        include_upstream=not ignore_dependencies,
+                        )
+            return dag
+
+        def func_date(start_date, end_date):
             if start_date:
                 try:
                     start_date = dateutil.parser.parse(start_date)
@@ -1380,15 +1406,14 @@ class REST_API(BaseView):
             if not (start_date or end_date):
                 msg = "Provide a start_date and/or end_date"
                 raise AirflowException(msg)
-            else:
-                # If only one date is passed, using same as start and end
-                end_date = end_date or start_date
-                start_date = start_date or end_date
-            if task_regex:
-                dag = dag.sub_dag(
-                        task_regex=args.task_regex,
-                        include_upstream=not ignore_dependencies,
-                        )
+            # If only one date is passed, using same as start and end
+            end_date = end_date or start_date
+            start_date = start_date or end_date
+            return start_date, end_date
+
+        try:
+            dag = func_dag()
+            start_date, end_date = func_date(start_date, end_date)
             if dry_run:
                 msg = "Dry run of DAG {0} on {1}".format(dag_id, start_date)
                 loggin.info(msg)
@@ -1479,51 +1504,60 @@ class REST_API(BaseView):
         args_get = request.args.get('get')
         args_delete = request.args.get('delete')
 
+        def func_set(session, qs):
+            name, slot_count, pool_description = args_set.split()
+            pool = qs.filter_by(pool=name).first()
+            flag_dirty = False
+            if pool:
+                if pool.slots != slot_count:
+                    pool.slots = slot_count
+                    flag_dirty = True
+                if pool.description != pool_description:
+                    pool.description = pool_description
+                    flag_dirty = True
+            else:
+                pool = Pool(
+                        pool=name,
+                        slots=slot_count,
+                        description=pool_description,
+                        )
+                flag_dirty = True
+            if flag_dirty:
+                session.add(pool)
+                session.commit()
+            return pool.to_json()
+
+        def func_get(qs):
+            pool = qs.filter_by(pool=args_get).first()
+            if pool:
+                return pool.to_json()
+            else:
+                msg = 'The "{}" record does not exist'.format(args_get)
+                raise AirflowException(msg)
+
+        def func_delete(session, qs):
+            pool = qs.filter_by(pool=args_delete).first()
+            if pool:
+                qs.filter_by(pool=args_delete).delete()
+                session.commit()
+                output = 'The "{}" record has been deleted'.format(
+                        args_delete)
+            else:
+                msg = 'The "{}" record does not exist'.format(args_delete)
+                raise AirflowException(msg)
+
         try:
             session = settings.Session()
             qs = session.query(Pool)
             if args_set:
                 # 设置
-                name, slot_count, pool_description = args_set.split()
-                pool = qs.filter_by(pool=name).first()
-                flag_dirty = False
-                if pool:
-                    if pool.slots != slot_count:
-                        pool.slots = slot_count
-                        flag_dirty = True
-                    if pool.description != pool_description:
-                        pool.description = pool_description
-                        flag_dirty = True
-                else:
-                    pool = Pool(
-                            pool=name,
-                            slots=slot_count,
-                            description=pool_description,
-                            )
-                    flag_dirty = True
-                if flag_dirty:
-                    session.add(pool)
-                    session.commit()
-                output = pool.to_json()
+                output = func_set(session, qs)
             elif args_get:
                 # 浏览
-                pool = qs.filter_by(pool=args_get).first()
-                if pool:
-                    output = pool.to_json()
-                else:
-                    msg = 'The "{}" record does not exist'.format(args_get)
-                    raise AirflowException(msg)
+                output = func_get(qs)
             elif args_delete:
                 # 删除
-                pool = qs.filter_by(pool=args_delete).first()
-                if pool:
-                    qs.filter_by(pool=args_delete).delete()
-                    session.commit()
-                    output = 'The "{}" record has been deleted'.format(
-                            args_delete)
-                else:
-                    msg = 'The "{}" record does not exist'.format(args_delete)
-                    raise AirflowException(msg)
+                output = func_set(session, qs)
             else:
                 raise AirflowException('No pool named found')
         except AirflowException as e:
@@ -1534,6 +1568,8 @@ class REST_API(BaseView):
         else:
             return REST_API_Response_Util.get_200_response(base_response,
                     output)
+        finally:
+            session.close()
 
     def clear(self, base_response):
         'Clear a set of task instance, as if they never ran'
@@ -1550,12 +1586,20 @@ class REST_API(BaseView):
         only_running = True if 'only_running' in request.args else False
         exclude_subdags = True if 'exclude_subdags' in request.args else False
 
-        try:
+        def func_dag():
             dagbag = DagBag(cli.process_subdir(subdir))
             if dag_id:
                 dag = dagbag.get_dag(dag_id)
             else:
                 raise AirflowException('Who hid the dig_id!?')
+            if task_regex:
+                dag = dag.sub_dag(
+                        task_regex=task_regex,
+                        include_downstream=downstream,
+                        include_upstream=upstream,
+                        )
+
+        def func_date(start_date, end_date):
             if start_date:
                 try:
                     start_date = dateutil.parser.parse(start_date).date()
@@ -1568,12 +1612,11 @@ class REST_API(BaseView):
                 except (ValueError, OverflowError):
                     raise AirflowException(self.s_msg.format('end_date',
                             end_date))
-            if task_regex:
-                dag = dag.sub_dag(
-                        task_regex=task_regex,
-                        include_downstream=downstream,
-                        include_upstream=upstream,
-                        )
+            return start_date, end_date
+
+        try:
+            dag = func_dag()
+            start_date, end_date = func_date(start_date, end_date)
             tis = dag.clear(
                     start_date=start_date,
                     end_date=end_date,
@@ -1609,10 +1652,10 @@ class REST_API(BaseView):
         pause = True if request.form.get('pause') is not None else False
         unpause = True if request.form.get('unpause') is not None else False
 
-        try:
-            if dag_file is None or not request.files['dag_file'].filename:
+        def func_file():
+            if dag_file is None or not dag_file.filename:
                 raise AirflowException("The dag_file argument wasn't provided")
-            if dag_file and dag_file.filename.endswith(".py"):
+            elif dag_file and dag_file.filename.endswith(".py"):
                 save_file_path = os.path.join(
                         airflow_dags_folder, dag_file.filename,
                         )
@@ -1630,7 +1673,9 @@ class REST_API(BaseView):
                         "with a .py."
                 logging.warning(s)
                 raise AirflowException("dag_file is not a *.py file")
+            return save_file_path
 
+        def func_imp(save_file_path):
             warning = None
             # if both the pause and unpause options are provided then skip the pausing and unpausing phase
             if pause and unpause:
@@ -1655,6 +1700,12 @@ class REST_API(BaseView):
                     warning = "Failed to set the state (pause, unpause) of " \
                             "the DAG: {}".format(e)
                     logging.warning(warning)
+            return warning
+
+        try:
+            save_file_path = func_file()
+            warning = func_imp(save_file_path)
+            output = "DAG File [{}] has been uploaded".format(dag_file)
         except AirflowException as e:
             error_message = str(e)
             logging.error(error_message)
@@ -1663,7 +1714,7 @@ class REST_API(BaseView):
         else:
             return REST_API_Response_Util.get_200_response(
                     base_response=base_response, 
-                    output="DAG File [{}] has been uploaded".format(dag_file),
+                    output=output,
                     warning=warning,
                     )
 
@@ -1676,7 +1727,7 @@ class REST_API(BaseView):
         try:
             if self.is_arg_not_provided(dag_id):
                 raise AirflowException("dag_id should be provided")
-            elif " " in dag_id:
+            if " " in dag_id:
                 s = "dag_id contains spaces and is therefore an illegal argument"
                 raise AirflowException(s)
             try:
@@ -1689,10 +1740,11 @@ class REST_API(BaseView):
                     session.merge(orm_dag)
                 session.commit()
                 detail = orm_dag.to_json()
-                session.close()
             except Exception as e:
                 s = "An error occurred while trying to Refresh the DAG '{}': {}"
                 raise AirflowException(s.format(dag_id, e))
+            finally:
+                session.close()
             output = {
                     'message': "DAG [{}] is now fresh as a daisy".format(dag_id),
                     'detail': detail,
@@ -1706,7 +1758,6 @@ class REST_API(BaseView):
         else:
             return REST_API_Response_Util.get_200_response(base_response,
                     output)
-
 
 
 # Creating View to be used by Plugin
