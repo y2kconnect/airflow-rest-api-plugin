@@ -1,33 +1,35 @@
 # -*- coding: utf-8 -*-
-''' 待完成 REST_API.backfill
-'''
-
 __author__ = 'robertsanders'
 __version__ = "1.0.3"
 
+# python apps
+import dateutil.parser
+import imp
+import logging
+import os
+import reprlib
+import socket
+import subprocess
+import warnings
+from datetime import datetime
+from flask import Blueprint, request, jsonify
+from flask_admin import BaseView, expose
+from sqlalchemy.orm import exc
+
+# airflow apps
+import airflow
 from airflow import configuration, jobs, settings
 from airflow.api.common.experimental import trigger_dag as trigger
 from airflow.bin import cli
 from airflow.exceptions import AirflowException
 from airflow.executors import DEFAULT_EXECUTOR
 from airflow.models import (
-        DagBag, DagModel, DagRun, Pool, TaskInstance, Variable,
+        Connection, DagBag, DagModel, DagRun, Pool, TaskInstance, Variable,
         )
 from airflow.plugins_manager import AirflowPlugin
 from airflow.ti_deps.dep_context import DepContext, QUEUE_DEPS, SCHEDULER_DEPS
 from airflow.www.app import csrf
 
-from flask import Blueprint, request, jsonify
-from flask_admin import BaseView, expose
-
-from datetime import datetime
-import airflow
-import dateutil.parser
-import logging
-import os
-import socket
-import subprocess
-import warnings
 
 """
 CLIs this REST API exposes are Defined here: http://airflow.incubator.apache.org/cli.html
@@ -781,44 +783,56 @@ class REST_API(BaseView):
         args_export = request.args.get('export')
         args_delete = request.args.get('delete')
 
+        def func_get():
+            var = Variable.get(
+                    args_get,
+                    deserialize_json=args_json,
+                    default_var=args_default,
+                    )
+            return {args_get: var}
+
+        def func_delete():
+            qs.filter_by(key=args_delete).delete()
+            session.commit()
+            return 'The "{}" variable has been deleted'.format(args_delete)
+
+        def func_set():
+            sep = ' '
+            arr = args_set.split() if sep in args_set else [args_set]
+            key = arr[0]
+            value = sep.join(arr[1:]) if 1 < len(arr) else None
+            Variable.set(key, value)
+            obj = qs.filter_by(key=key).first()
+            return obj.to_json() if obj else None
+
+        def func_import():
+            if os.path.exists(args_import):
+                import_helper(args_import)
+                return 'The "{}" file successfully loads.'.format(args_import)
+            else:
+                raise AirflowException("Missing variables file.")
+
+        def func_export():
+            cli.export_helper(args_export)
+            return 'The "{}" file successfully write.'.format(args_export)
+
         output = {}
         try:
             session = settings.Session()
             qs = session.query(Variable)
             if args_get:
                 # 浏览
-                var = Variable.get(
-                        args_get,
-                        deserialize_json=args_json,
-                        default_var=args_default,
-                        )
-                output['get'] = {args_get: var}
+                output['get'] = func_get()
             if args_delete:
                 # 删除
-                qs.filter_by(key=args_delete).delete()
-                session.commit()
-                output['delete'] = 'The "{}" variable has been deleted'.format(
-                        args_delete)
+                output['delete'] = func_delete()
             if args_set:
                 # 设置
-                sep = ' '
-                arr = args_set.split() if sep in args_set else [args_set]
-                key = arr[0]
-                value = sep.join(arr[1:]) if 1 < len(arr) else None
-                Variable.set(key, value)
-                obj = qs.filter_by(key=key).first()
-                output['set'] = obj.to_json() if obj else None
+                output['set'] = func_set()
             if args_import:
-                if os.path.exists(args_import):
-                    import_helper(args_import)
-                    output['import'] = 'The "{}" file successfully loads.' \
-                            .format(args_import)
-                else:
-                    raise AirflowException("Missing variables file.")
+                output['import'] = func_import()
             if args_export:
-                cli.export_helper(args_export)
-                output['export'] = 'The "{}" file successfully write.' \
-                            .format(args_export)
+                output['export'] = func_export()
             if not (
                     args_set
                     or args_get
@@ -836,10 +850,109 @@ class REST_API(BaseView):
         else:
             return REST_API_Response_Util.get_200_response(base_response,
                     output)
+        finally:
+            session.close()
 
+    def connections(self, base_response):
+        'List/Add/Delete connections'
+        logging.info("Executing custom 'connections' function")
 
-    # def connections(self, base_response):
-    #     pass
+        s_msg = 'The following args are not compatible with the --{s_label} ' \
+                'flag: {invalid!r}'
+        args_list = True if 'list' in request.args else False
+        args_add = True if 'add' in request.args else False
+        args_delete = True if 'delete' in request.args else False
+        conn_id = request.args.get('conn_id')
+        conn_url = request.args.get('conn_url')
+        conn_extra = request.args.get('conn_extra')
+
+        def func_list(qs, info):
+            'Check that no other flags were passed to the command'
+            invalid_args = [
+                    arg
+                    for arg in ['conn_id', 'conn_uri', 'conn_extra']
+                        if info.get(arg) is not None
+                    ]
+            if invalid_args:
+                msg = s_msg.format(invalid=invalid_args, s_label='list')
+                raise AirflowException(msg)
+            output = [x.to_json() for x in qs]
+            return output
+
+        def func_delete(qs, info, session):
+            invalid_args = [
+                    arg
+                    for arg in ['conn_uri', 'conn_extra']
+                        if info.get(arg) is not None
+                    ]
+            if invalid_args:
+                msg = s_msg.format(invalid=invalid_args, s_label='delete')
+                raise AirflowException(msg)
+            if conn_id is None:
+                msg = 'To delete a connection, you Must provide a value for ' \
+                        'the --conn_id flag.'
+                raise AirflowException(msg)
+            try:
+                to_delete = qs.filter_by(conn_id=conn_id).one()
+            except exc.NoResultFound:
+                msg = 'Did not find a connection with `conn_id`={conn_id}' \
+                        .format(conn_id=conn_id)
+                raise AirflowException(msg)
+            except exc.MultipleResultsFound:
+                msg = 'Found more than one connection with `conn_id`={conn_id}' \
+                        .format(conn_id=conn_id)
+                raise AirflowException(msg)
+            deleted_conn_id = to_delete.conn_id
+            session.delete(to_delete)
+            session.commit()
+            output = 'Successfully deleted `conn_id`={conn_id}' \
+                    .format(conn_id=deleted_conn_id)
+            return output
+
+        def func_add(qs, info, session):
+            missing_args = [
+                    arg
+                    for arg in ['conn_id', 'conn_uri']
+                        if info.get(arg) is None
+                    ]
+            if missing_args:
+                msg = 'The following args are required to add a ' \
+                        'connection: {missing!r}'
+                raise AirflowException(msg.format(missing=missing_args))
+            new_conn = Connection(conn_id=conn_id, uri=conn_uri)
+            if conn_extra is not None:
+                new_conn.set_extra(conn_extra)
+            if qs.filter_by(conn_id=new_conn.conn_id).first():
+                output = 'A connection with `conn_id`={conn_id} already ' \
+                        'exists'.format(conn_id=new_conn.conn_id)
+            else:
+                session.add(new_conn)
+                session.commit()
+                output = 'Successfully added `conn_id`={conn_id} : {uri}' \
+                        .format(conn_id=new_conn.conn_id, uri=args.conn_uri)
+            return output
+
+        try:
+            session = settings.Session()
+            qs = session.query(Connection)
+            if args_list:
+                output = func_list(qs, locals())
+            elif args_delete:
+                output = func_delete(qs, locals(), session)
+            elif args_add:
+                output = func_add(qs, locals(), session)
+            else:
+                raise AirflowException('Please select list/add/delete')
+        except AirflowException as e:
+            error_message = str(e)
+            logging.error(error_message)
+            return REST_API_Response_Util.get_400_error_response(base_response,
+                    error_message)
+        else:
+            return REST_API_Response_Util.get_200_response(base_response,
+                    output)
+        finally:
+            session.close()
 
     def pause(self, base_response):
         'Pauses a DAG'
@@ -998,7 +1111,6 @@ class REST_API(BaseView):
             return REST_API_Response_Util.get_200_response(base_response,
                     output)
 
-
     def dag_state(self, base_response):
         'Get the status of a dag run'
         logging.info("Executing custom 'dag_state' function")
@@ -1030,6 +1142,10 @@ class REST_API(BaseView):
         'Run a single task instance'
         logging.info("Executing custom 'run_web' function")
 
+        s_warn = 'The S3_LOG_FOLDER conf key has been replaced by ' \
+                'REMOTE_BASE_LOG_FOLDER. Your conf still works but please ' \
+                'update airflow.cfg to ensure future compatibility.'
+
         dag_id = request.args.get('dag_id')
         task_id = request.args.get('task_id')
         execution_date = request.args.get('execution_date')
@@ -1048,9 +1164,6 @@ class REST_API(BaseView):
         ship_dag = True if 'ship_dag' in request.args else False
         pickle = request.args.get('pickle')
 
-        s_warn = 'The S3_LOG_FOLDER conf key has been replaced by ' \
-                'REMOTE_BASE_LOG_FOLDER. Your conf still works but please ' \
-                'update airflow.cfg to ensure future compatibility.'
         try:
             if cfg_path and os.path.exists(cfg_path):
                 with open(cfg_path, 'r') as conf_file:
@@ -1528,7 +1641,6 @@ class REST_API(BaseView):
                 try:
                     # import the DAG file that was uploaded so that we can get 
                     # the DAG_ID to execute the command to pause or unpause it
-                    import imp
                     dag_file = imp.load_source('module.name', save_file_path)
                     dag_id = dag_file.dag.dag_id
 
