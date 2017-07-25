@@ -1604,6 +1604,7 @@ class REST_API(BaseView):
                         include_downstream=downstream,
                         include_upstream=upstream,
                         )
+            return dag
 
         def func_date(start_date, end_date):
             if start_date:
@@ -1623,20 +1624,15 @@ class REST_API(BaseView):
         try:
             dag = func_dag()
             start_date, end_date = func_date(start_date, end_date)
-            tis = dag.clear(
+            count = dag.clear(
                     start_date=start_date,
                     end_date=end_date,
                     only_failed=only_failed,
                     only_running=only_running,
                     include_subdags=not exclude_subdags,
-                    dry_run=True,
                     )
-            if tis:
-                output = {
-                        'message': "Here's the list of task instances you are" \
-                                " about to clear",
-                        'details': [t.to_json() for t in tis],
-                        }
+            if count:
+                output = "{0} task instances have been cleared".format(count)
             else:
                 raise AirflowException("No task instances to clear")
         except AirflowException as e:
