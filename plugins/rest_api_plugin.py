@@ -232,7 +232,7 @@ apis_metadata = [
         "http_method": "GET",
         "arguments": [
             {"name": "dag_id", "description": "The id of the dag", "form_input_type": "text", "required": True, "cli_end_position": 1},
-            {"name": "execution_date", "description": "The execution date of the DAG (Example: 2017-01-02T03:04:05)", "form_input_type": "text", "required": True, "cli_end_position": 2},
+            {"name": "execution_date", "description": "The execution date of the DAG (Example: 2017-01-02T03:04:05)", "form_input_type": "text", "required": False},
             {"name": "subdir", "description": "File location or directory from which to look for the dag", "form_input_type": "text", "required": False}
         ]
     },
@@ -1124,13 +1124,17 @@ class REST_API(BaseView):
         try:
             dagbag = DagBag(cli.process_subdir(subdir))
             dag = dagbag.get_dag(dag_id)
-            try:
-                execution_date = dateutil.parser.parse(execution_date)
-            except (ValueError, OverflowError):
-                msg = self.s_msg.format('execution', execution_date)
-                raise AirflowException(msg)
-            dr = DagRun.find(dag_id, execution_date=execution_date)
-            output = dr[0].state if len(dr) > 0 else None
+            if execution_date:
+                try:
+                    execution_date = dateutil.parser.parse(execution_date)
+                except (ValueError, OverflowError):
+                    msg = self.s_msg.format('execution', execution_date)
+                    raise AirflowException(msg)
+                dr = DagRun.find(dag_id, execution_date=execution_date)
+                output = dr[0].to_json()
+            else:
+                dr = DagRun.find(dag_id)
+                output = [obj.to_json() for obj in dr]
         except AirflowException as e:
             error_message = str(e)
             logging.error(error_message)
