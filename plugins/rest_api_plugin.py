@@ -1024,15 +1024,18 @@ class REST_API(BaseView):
             dep_context = DepContext(deps=SCHEDULER_DEPS)
             failed_deps = list(ti.get_failed_dep_statuses(dep_context=
                     dep_context))
+            output = {}
             if failed_deps:
-                info_error = {dep.dep_name: dep.reason for dep in failed_deps}
-                raise AirflowException('flag_failed_deps')
-            output = "Task instance dependencies are all met."
+                output['message'] = 'Task instance dependencies are fail.'
+                output['detail'] = {
+                        dep.dep_name: dep.reason
+                        for dep in failed_deps
+                        }
+            else:
+                output['message'] = 'Task instance dependencies are all met.'
+                output['detail'] = None
         except AirflowException as e:
             error_message = str(e)
-            # 特例
-            if error_message == 'flag_failed_deps':
-                error_message = info_error
             logging.error(error_message)
             return REST_API_Response_Util.get_400_error_response(base_response,
                     error_message)
@@ -1130,11 +1133,15 @@ class REST_API(BaseView):
                 except (ValueError, OverflowError):
                     msg = self.s_msg.format('execution', execution_date)
                     raise AirflowException(msg)
-                dr = DagRun.find(dag_id, execution_date=execution_date)
-                output = dr[0].to_json()
+            arr = dag.to_json(execution_date)
+            output = {
+                    'message': None,
+                    'detail': None,
+                    }
+            if arr:
+                output['detail'] = arr
             else:
-                dr = DagRun.find(dag_id)
-                output = [obj.to_json() for obj in dr]
+                output['message'] = 'The record does not exist.'
         except AirflowException as e:
             error_message = str(e)
             logging.error(error_message)
@@ -1486,7 +1493,7 @@ class REST_API(BaseView):
                         'detail': detail,
                         }
             else:
-                output = sorted(dagbag.dags)
+                output = {'detail': sorted(dagbag.dags)}
         except AirflowException as e:
             logging.error(error_message)
             return REST_API_Response_Util.get_400_error_response(base_response,
@@ -1504,6 +1511,10 @@ class REST_API(BaseView):
         execution_date = request.args.get('execution_date')
         subdir = request.args.get('subdir')
 
+        output = {
+                'message': None,
+                'detail': None,
+                }
         try:
             dagbag = DagBag(cli.process_subdir(subdir))
             if dag_id:
@@ -1516,8 +1527,20 @@ class REST_API(BaseView):
             except (ValueError, OverflowError):
                 raise AirflowException(self.s_msg.format(
                         'execution', execution_date))
-            ti = TaskInstance(task, execution_date)
-            output = ti.current_state()
+            obj = TaskInstance(task, execution_date)
+            try:
+                session = settings.Session()
+                ti = session.query(TaskInstance).filter_by(
+                        dag_id=obj.dag_id,
+                        task_id=obj.task_id,
+                        execution_date=obj.execution_date,
+                        ).first()
+            finally:
+                session.close()
+            if ti:
+                output['detail'] = ti.to_json()
+            else:
+                output['message'] = 'The record does not exist.'
         except AirflowException as e:
             error_message = str(e)
             logging.error(error_message)
@@ -1657,9 +1680,9 @@ class REST_API(BaseView):
                     include_subdags=not exclude_subdags,
                     )
             if count:
-                output = "{0} task instances have been cleared".format(count)
+                output = "{0} task instances have been cleared.".format(count)
             else:
-                raise AirflowException("No task instances to clear")
+                output = "No task instances to clear."
         except AirflowException as e:
             error_message = str(e)
             logging.error(error_message)
