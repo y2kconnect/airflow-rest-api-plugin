@@ -233,7 +233,9 @@ apis_metadata = [
         "arguments": [
             {"name": "dag_id", "description": "The id of the dag", "form_input_type": "text", "required": True, "cli_end_position": 1},
             {"name": "execution_date", "description": "The execution date of the DAG (Example: 2017-01-02T03:04:05)", "form_input_type": "text", "required": False},
-            {"name": "subdir", "description": "File location or directory from which to look for the dag", "form_input_type": "text", "required": False}
+            {"name": "subdir", "description": "File location or directory from which to look for the dag", "form_input_type": "text", "required": False},
+            {"name": "like", "description": "Seek the exection_date of DAG", "form_input_type": "checkbox", "required": False},
+            {"name": "execution_regex", "description": "execution_regex in execution_date.isoformat()", "form_input_type": "text", "required": False}
         ]
     },
     {
@@ -1123,23 +1125,50 @@ class REST_API(BaseView):
         dag_id = request.args.get('dag_id')
         execution_date = request.args.get('execution_date')
         subdir = request.args.get('subdir')
+        seek = True if 'seek' in request.args else False
+        execution_regex = request.args.get('execution_regex')
 
+        warning = None
         try:
             dagbag = DagBag(cli.process_subdir(subdir))
             dag = dagbag.get_dag(dag_id)
-            if execution_date:
+            if execution_date and seek:
+                warning = 'Both options execution_date and seek were given. ' \
+                        'Skipping setting the (exection_date, seek) of the DAG.'
+                logging.warning(warning)
+                arr = dag.to_json()
+            elif execution_date:
                 try:
                     execution_date = dateutil.parser.parse(execution_date)
                 except (ValueError, OverflowError):
                     msg = self.s_msg.format('execution', execution_date)
                     raise AirflowException(msg)
-            arr = dag.to_json(execution_date)
+                arr = dag.to_json(execution_date)
+            elif seek:
+                if execution_regex:
+                    try:
+                        session = settings.Session()
+                        qs = session.query(DagRun).filter_by(dag_id=dag_id)
+                        arr = [
+                                obj.to_json()
+                                for obj in qs
+                                    if execution_regex in \
+                                            obj.execution_date.isoformat()
+                                ]
+                    finally:
+                        session.close()
+                else:
+                    arr = None
+            else:
+                arr = dag.to_json()
             output = {
                     'message': None,
                     'detail': None,
+                    'count': None,
                     }
             if arr:
                 output['detail'] = arr
+                output['count'] = len(arr)
             else:
                 output['message'] = 'The record does not exist.'
         except AirflowException as e:
@@ -1148,8 +1177,11 @@ class REST_API(BaseView):
             return REST_API_Response_Util.get_400_error_response(base_response,
                     error_message)
         else:
-            return REST_API_Response_Util.get_200_response(base_response,
-                    output)
+            return REST_API_Response_Util.get_200_response(
+                    base_response=base_response, 
+                    output=output,
+                    warning=warning,
+                    )
 
     def run(self, base_response):
         'Run a single task instance'
