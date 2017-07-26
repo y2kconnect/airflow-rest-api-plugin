@@ -1458,10 +1458,31 @@ class REST_API(BaseView):
         logging.info("Executing custom 'list_dags' function")
 
         subdir = request.args.get('subdir')
+        report = True if 'report' in request.args else False
 
         try:
             dagbag = DagBag(cli.process_subdir(subdir))
-            output = sorted(dagbag.dags)
+            if report:
+                stats = dagbag.dagbag_stats
+                detail = [
+                        {
+                                'file': obj.file,
+                                'duration': obj.duration,
+                                'dag_num': obj.dag_num,
+                                'task_num': obj.task_num,
+                                'dags': eval(obj.dags),
+                                }
+                        for obj in stats
+                        ]
+                output = {
+                        'dag_folder': dagbag.dag_folder,
+                        'Number of DAGs': sum([o.dag_num for o in stats]),
+                        'Total task number': sum([o.dag_num for o in stats]),
+                        'DagBag parsing time': sum([o.duration for o in stats]),
+                        'detail': detail,
+                        }
+            else:
+                output = sorted(dagbag.dags)
         except AirflowException as e:
             logging.error(error_message)
             return REST_API_Response_Util.get_400_error_response(base_response,
