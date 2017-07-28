@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import reprlib
+import requests
 import socket
 import subprocess
 import warnings
@@ -234,8 +235,8 @@ apis_metadata = [
             {"name": "dag_id", "description": "The id of the dag", "form_input_type": "text", "required": True, "cli_end_position": 1},
             {"name": "execution_date", "description": "The execution date of the DAG (Example: 2017-01-02T03:04:05)", "form_input_type": "text", "required": False},
             {"name": "subdir", "description": "File location or directory from which to look for the dag", "form_input_type": "text", "required": False},
-            {"name": "like", "description": "Seek the exection_date of DAG", "form_input_type": "checkbox", "required": False},
-            {"name": "execution_regex", "description": "execution_regex in execution_date.isoformat()", "form_input_type": "text", "required": False}
+            {"name": "seek", "description": "Seek the exection_date of DAG", "form_input_type": "checkbox", "required": False},
+            {"name": "execution_regex", "description": "execution_regex in '2017-01-02T03:04:05.123456'", "form_input_type": "text", "required": False}
         ]
     },
     {
@@ -446,6 +447,17 @@ apis_metadata = [
         "http_method": "GET",
         "arguments": [
             {"name": "dag_id", "description": "The id of the dag", "form_input_type": "text", "required": True}
+        ]
+    },
+    {
+        "name": "log",
+        "description": "Loading log of a single task instance",
+        "airflow_version": "1.0.0 or greater",
+        "http_method": "GET",
+        "arguments": [
+            {"name": "dag_id", "description": "The id of the dag", "form_input_type": "text", "required": True, "cli_end_position": 1},
+            {"name": "task_id", "description": "The id of the task", "form_input_type": "text", "required": True, "cli_end_position": 2},
+            {"name": "execution_date", "description": "The execution date of the DAG (Example: 2017-01-02T03:04:05)", "form_input_type": "text", "required": True, "cli_end_position": 3},
         ]
     }
 ]
@@ -1840,6 +1852,108 @@ class REST_API(BaseView):
         else:
             return REST_API_Response_Util.get_200_response(base_response,
                     output)
+
+    def log(self, base_response):
+        'Loading log of a single task instance'
+        pass
+
+        dag_id = request.args.get('dag_id')
+        task_id = request.args.get('task_id')
+        execution_date = request.args.get('execution_date')
+
+        log = []
+        BASE_LOG_FOLDER = configuration.get('core', 'BASE_LOG_FOLDER')
+        WORKER_LOG_SERVER_PORT = configuration.get('celery', 'WORKER_LOG_SERVER_PORT')
+        REMOTE_BASE_LOG_FOLDER = configuration.get('core', 'REMOTE_BASE_LOG_FOLDER')
+        try:
+            session = settings.Session()
+            dagbag = DagBag()
+            if dag_id:
+                dag = dagbag.get_dag(dag_id)
+            else:
+                raise AirflowException('Who hid the dig_id!?')
+            task = dag.get_task(task_id=task_id)
+            try:
+                execution_date = dateutil.parser.parse(execution_date)
+            except (ValueError, OverflowError):
+                msg = self.s_msg.format('execution', execution_date)
+                raise AirflowException(msg)
+            log_relative = "{dag_id}/{task_id}/{execution_date}".format(
+                    dag_id=dag_id,
+                    task_id=task_id,
+                    execution_date=execution_date.isoformat(),
+                    )
+            ti = session.query(TaskInstance).filter_by(
+                    dag_id=dag_id,
+                    task_id=task_id,
+                    execution_date=execution_date,
+                    ).first()
+            if not ti:
+                msg = 'TaskInstance records not found. dag_id: {dag_id}, ' \
+                        'task_id: {task_id}, execution_date: {execution_date}'
+                raise AirflowException(msg.format(**local()))
+            loc = os.path.join(
+                    os.path.expanduser(BASE_LOG_FOLDER),
+                    log_relative,
+                    )
+            print('\n\nloc: {}\n\n'.format(loc))
+            host = ti.hostname
+            log_loaded = False
+            if os.path.exists(loc):
+                try:
+                    with open(loc) as f:
+                        log.append(f.read())
+                    log_loaded = True
+                except:
+                    msg = "*** Failed to load local log file: {0}.".format(loc)
+                    raise AirflowException(msg)
+            else:
+                url = os.path.join("http://{host}:{WORKER_LOG_SERVER_PORT}/log",
+                        log_relative).format(**locals())
+                x = [
+                        "*** Log file isn't local.",
+                        'Fetching here: {}'.format(url)
+                        ]
+                log.extend(x)
+                try:
+                    timeout = None  # No timeout
+                    try:
+                        timeout = configuration.getint('webserver',
+                                'log_fetch_timeout_sec')
+                    except (AirflowConfigException, ValueError):
+                        pass
+                    response = requests.get(url, timeout=timeout)
+                    response.raise_for_status()
+                    log.append(response.text)
+                    log_loaded = True
+                except:
+                    msg = "*** Failed to fetch log file from worker. url: {}"
+                    log.append(msg.format(url))
+            if not log_loaded:
+                # load remote logs
+                remote_log = os.path.join(REMOTE_BASE_LOG_FOLDER, log_relative)
+                log.append('*** Reading remote logs...')
+                if remote_log.startswith('s3:/'):
+                    # S3
+                    msg = log_utils.S3Log().read(remote_log, return_error=True)
+                elif remote_log.startswith('gs:/'):
+                    # GCS
+                    msg = log_utils.GCSLog().read(remote_log, return_error=True)
+                elif remote_log:
+                    # unsupported
+                    msg = '*** Unsupported remote log location.'
+                log.append(msg)
+            output = log
+        except AirflowException as e:
+            error_message = str(e)
+            logging.error(error_message)
+            return REST_API_Response_Util.get_400_error_response(base_response,
+                    error_message)
+        else:
+            return REST_API_Response_Util.get_200_response(base_response,
+                    output)
+        finally:
+            session.close()
 
 
 # Creating View to be used by Plugin
