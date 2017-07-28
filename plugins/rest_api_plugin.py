@@ -1891,7 +1891,7 @@ class REST_API(BaseView):
             if not ti:
                 msg = 'TaskInstance records not found. dag_id: {dag_id}, ' \
                         'task_id: {task_id}, execution_date: {execution_date}'
-                raise AirflowException(msg.format(**local()))
+                raise AirflowException(msg.format(**locals()))
             loc = os.path.join(
                     os.path.expanduser(BASE_LOG_FOLDER),
                     log_relative,
