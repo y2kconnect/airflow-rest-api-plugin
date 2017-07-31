@@ -1148,21 +1148,28 @@ class REST_API(BaseView):
 
         warning = None
         try:
-            dagbag = DagBag(cli.process_subdir(subdir))
-            dag = dagbag.get_dag(dag_id)
-            if execution_date and seek:
-                warning = 'Both options execution_date and seek were given. ' \
-                        'Skipping setting the (exection_date, seek) of the DAG.'
-                logging.warning(warning)
-                arr = dag.to_json()
+            session = settings.Session()
+            qs = session.query(DagRun).filter_by(dag_id=dag_id)
+            if (
+                    execution_date is None and seek is False
+                    or execution_date and seek
+                    ):
+                arr = [obj.to_json() for obj in qs]
+                if execution_date and seek:
+                    warning = 'Both options execution_date and seek were ' \
+                            'given. Skipping setting the (exection_date, ' \
+                            'seek) of the DAG.'
+                    logging.warning(warning)
             elif execution_date:
                 try:
                     execution_date = dateutil.parser.parse(execution_date)
                 except (ValueError, OverflowError):
                     msg = self.s_msg.format('execution', execution_date)
                     raise AirflowException(msg)
-                arr = dag.to_json(execution_date)
-            elif seek:
+                obj = qs.filter_by(execution_date=execution_date).first()
+                arr = obj.to_json() if obj else None
+            else:
+                # seek is True
                 if conf:
                     try:
                         run_conf = json.loads(conf)
@@ -1172,35 +1179,28 @@ class REST_API(BaseView):
                 else:
                     run_conf = None
                 arr = []
-                try:
-                    session = settings.Session()
-                    qs = session.query(DagRun).filter_by(dag_id=dag_id)
-                    for obj in qs:
-                        arr_flag = []
-                        if execution_regex:
-                            s = obj.execution_date.isoformat()
-                            flag = True if execution_regex in s else False
-                            arr_flag.append(flag)
-                        if conf:
-                            x = (
-                                    True if v == obj.conf.get(k) else False
-                                    for k, v in run_conf.items()
-                                    )
-                            flag = True if all(x) else False
-                            arr_flag.append(flag)
-                        if conf_key:
-                            flag = True if conf_key in obj.conf else False
-                            arr_flag.append(flag)
-                        if conf_value:
-                            flag = True if conf_value in obj.conf.values() \
-                                    else False
-                            arr_flag.append(flag)
-                        if all(arr_flag):
-                            arr.append(obj.to_json())
-                finally:
-                    session.close()
-            else:
-                arr = dag.to_json()
+                for obj in qs:
+                    arr_flag = []
+                    if execution_regex:
+                        s = obj.execution_date.isoformat()
+                        flag = True if execution_regex in s else False
+                        arr_flag.append(flag)
+                    if conf:
+                        x = (
+                                True if v == obj.conf.get(k) else False
+                                for k, v in run_conf.items()
+                                )
+                        flag = True if all(x) else False
+                        arr_flag.append(flag)
+                    if conf_key:
+                        flag = True if conf_key in obj.conf else False
+                        arr_flag.append(flag)
+                    if conf_value:
+                        flag = True if conf_value in obj.conf.values() else \
+                                False
+                        arr_flag.append(flag)
+                    if all(arr_flag):
+                        arr.append(obj.to_json())
             output = {
                     'message': None,
                     'detail': None,
@@ -1222,6 +1222,8 @@ class REST_API(BaseView):
                     output=output,
                     warning=warning,
                     )
+        finally:
+            session.close()
 
     def run(self, base_response):
         'Run a single task instance'
@@ -1883,8 +1885,6 @@ class REST_API(BaseView):
 
     def log(self, base_response):
         'Loading log of a single task instance'
-        pass
-
         dag_id = request.args.get('dag_id')
         task_id = request.args.get('task_id')
         execution_date = request.args.get('execution_date')
