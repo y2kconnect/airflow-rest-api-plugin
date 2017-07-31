@@ -236,7 +236,10 @@ apis_metadata = [
             {"name": "execution_date", "description": "The execution date of the DAG (Example: 2017-01-02T03:04:05)", "form_input_type": "text", "required": False},
             {"name": "subdir", "description": "File location or directory from which to look for the dag", "form_input_type": "text", "required": False},
             {"name": "seek", "description": "Seek the exection_date of DAG", "form_input_type": "checkbox", "required": False},
-            {"name": "execution_regex", "description": "execution_regex in '2017-01-02T03:04:05.123456'", "form_input_type": "text", "required": False}
+            {"name": "execution_regex", "description": "execution_regex in '2017-01-02T03:04:05.123456'", "form_input_type": "text", "required": False},
+            {"name": "conf", "description": "JSON string that gets pickled into the DagRun's conf attribute", "form_input_type": "text", "required": False},
+            {"name": "conf_key", "description": "key string that the DagRun's conf attribute", "form_input_type": "text", "required": False},
+            {"name": "conf_value", "description": "value string that the DagRun's conf attribute", "form_input_type": "text", "required": False},
         ]
     },
     {
@@ -1139,6 +1142,9 @@ class REST_API(BaseView):
         subdir = request.args.get('subdir')
         seek = True if 'seek' in request.args else False
         execution_regex = request.args.get('execution_regex')
+        conf = request.args.get('conf')
+        conf_key = request.args.get('conf_key')
+        conf_value = request.args.get('conf_value')
 
         warning = None
         try:
@@ -1157,20 +1163,42 @@ class REST_API(BaseView):
                     raise AirflowException(msg)
                 arr = dag.to_json(execution_date)
             elif seek:
-                if execution_regex:
+                if conf:
                     try:
-                        session = settings.Session()
-                        qs = session.query(DagRun).filter_by(dag_id=dag_id)
-                        arr = [
-                                obj.to_json()
-                                for obj in qs
-                                    if execution_regex in \
-                                            obj.execution_date.isoformat()
-                                ]
-                    finally:
-                        session.close()
+                        run_conf = json.loads(conf)
+                    except json.JSONDecodeError as e:
+                        msg = '{}. conf: {}'.format(e, conf)
+                        raise AirflowException(msg)
                 else:
-                    arr = None
+                    run_conf = None
+                arr = []
+                try:
+                    session = settings.Session()
+                    qs = session.query(DagRun).filter_by(dag_id=dag_id)
+                    for obj in qs:
+                        arr_flag = []
+                        if execution_regex:
+                            s = obj.execution_date.isoformat()
+                            flag = True if execution_regex in s else False
+                            arr_flag.append(flag)
+                        if conf:
+                            x = (
+                                    True if v == obj.conf.get(k) else False
+                                    for k, v in run_conf.items()
+                                    )
+                            flag = True if all(x) else False
+                            arr_flag.append(flag)
+                        if conf_key:
+                            flag = True if conf_key in obj.conf else False
+                            arr_flag.append(flag)
+                        if conf_value:
+                            flag = True if conf_value in obj.conf.values() \
+                                    else False
+                            arr_flag.append(flag)
+                        if all(arr_flag):
+                            arr.append(obj.to_json())
+                finally:
+                    session.close()
             else:
                 arr = dag.to_json()
             output = {
