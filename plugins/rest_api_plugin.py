@@ -1187,7 +1187,8 @@ class REST_API(BaseView):
                         arr_flag.append(flag)
                     if conf:
                         x = (
-                                True if v == obj.conf.get(k) else False
+                                True if obj.conf and v == obj.conf.get(k) \
+                                        else False
                                 for k, v in run_conf.items()
                                 )
                         flag = True if all(x) else False
